@@ -1143,8 +1143,16 @@ int publish_reserve(const DoutPrefixProvider* dpp,
           [] (const rgw_account_id& a) -> std::string { return a; }
           ), topic_cfg.owner);
       const RGWPubSub ps(res.store, topic_tenant, site);
-      int ret = ps.get_topic(res.dpp, topic_cfg.dest.arn_topic,
-                             topic_cfg, res.yield, nullptr);
+      // Auto-generated notification topics can share dest.arn_topic while
+      // their stored topic name is unique (notification_id + topic_name).
+      // Reload by the unique name when available to avoid cross-topic leakage.
+      const std::string& lookup_topic =
+          (topic_cfg.name.empty() || topic_cfg.name == topic_cfg.dest.arn_topic)
+              ? topic_cfg.dest.arn_topic
+              : topic_cfg.name;
+      // Use lookup_topic to avoid loading a shared base topic when this
+      // notification has a unique auto-generated topic.
+      int ret = ps.get_topic(res.dpp, lookup_topic, topic_cfg, res.yield, nullptr);
       if (ret < 0) {
         ldpp_dout(res.dpp, 1)
             << "INFO: failed to load topic: " << topic_cfg.dest.arn_topic
