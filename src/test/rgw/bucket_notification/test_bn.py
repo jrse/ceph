@@ -905,6 +905,75 @@ def test_topic():
 
 
 @pytest.mark.basic_test
+def test_topic_arn_unique_for_same_endpoint():
+    """ topics with same endpoint must get distinct ARNs """
+
+    tenant = 'dup_arn'
+    conn = connect_random_user(tenant)
+
+    # make sure there are no leftover topics
+    delete_all_topics(conn, '', get_config_cluster())
+    delete_all_topics(conn, tenant, get_config_cluster())
+
+    zonegroup = get_config_zonegroup()
+    bucket_name = gen_bucket_name()
+    conn.create_bucket(bucket_name)
+    topic_name = bucket_name + TOPIC_SUFFIX
+
+    # create two topics pointing to the same endpoint
+    endpoint_address = 'http://127.0.0.1:9001'
+    endpoint_args = 'push-endpoint=' + endpoint_address
+    topic_conf1 = PSTopicS3(conn, topic_name + '_1', zonegroup, endpoint_args=endpoint_args)
+    topic_conf2 = PSTopicS3(conn, topic_name + '_2', zonegroup, endpoint_args=endpoint_args)
+    topic_arn1 = topic_conf1.set_config()
+    topic_arn2 = topic_conf2.set_config()
+
+    assert topic_arn1 != topic_arn2
+    assert topic_name + '_1' in topic_arn1
+    assert topic_name + '_2' in topic_arn2
+    list_topics(2, tenant)
+
+    # create bucket notifications for each topic
+    notification_name = bucket_name + NOTIFICATION_SUFFIX
+    topic_conf_list = [
+        {
+            'Id': notification_name + '_1',
+            'TopicArn': topic_arn1,
+            'Events': ['s3:ObjectCreated:*'],
+        },
+        {
+            'Id': notification_name + '_2',
+            'TopicArn': topic_arn2,
+            'Events': ['s3:ObjectCreated:*'],
+        },
+    ]
+    s3_notification_conf = PSNotificationS3(conn, bucket_name, topic_conf_list)
+    _, status = s3_notification_conf.set_config()
+    assert status/100 == 2
+
+    # delete the first notification, the second topic must remain valid
+    _, status = s3_notification_conf.del_config(notification=notification_name + '_1')
+    assert status/100 == 2
+
+    result, status = s3_notification_conf.get_config()
+    assert status == 200
+    assert len(result['TopicConfigurations']) == 1
+    assert result['TopicConfigurations'][0]['TopicArn'] == topic_arn2
+
+    topic2_result = get_topic(topic_name + '_2', tenant, allow_failure=True)
+    assert topic2_result[1] == 0, 'expected topic to exist after deleting other notification'
+    topic2 = json.loads(topic2_result[0])
+    assert topic2['arn'] == topic_arn2
+    list_topics(2, tenant)
+
+    # cleanup
+    s3_notification_conf.del_config()
+    topic_conf1.del_config()
+    topic_conf2.del_config()
+    conn.delete_bucket(bucket_name)
+
+
+@pytest.mark.basic_test
 def test_topic_admin():
     """ test topics set/get/delete """
 
