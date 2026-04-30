@@ -33,6 +33,7 @@ from cephadm.utils import forall_hosts, cephadmNoImage, is_repo_digest, \
 from mgr_module import MonCommandFailed
 from mgr_util import format_bytes
 from cephadm.services.service_registry import service_registry
+from cephadm.services.nfs import NFSService
 
 from . import utils
 from . import exchange
@@ -119,6 +120,8 @@ class CephadmServe:
                     self._purge_deleted_services()
 
                     self._check_for_moved_osds()
+
+                    self._retry_failed_operations()
 
                     if self.mgr.agent_helpers._handle_use_agent_setting():
                         continue
@@ -252,8 +255,11 @@ class CephadmServe:
         @forall_hosts
         def refresh(host: str) -> None:
 
-            # skip hosts that are in maintenance - they could be powered off
-            if self.mgr.inventory._inventory[host].get("status", "").lower() == "maintenance":
+            # skip hosts that were removed or are in maintenance - they could be powered off
+            host_info = self.mgr.inventory._inventory.get(host)
+            if host_info is None:
+                return
+            if host_info.get("status", "").lower() == "maintenance":
                 return
 
             if self.mgr.use_agent:
@@ -443,6 +449,17 @@ class CephadmServe:
         self.mgr.cache.update_host_networks(host, networks)
         self.mgr.cache.save_host(host)
         return None
+
+    async def get_rdma_devices(self, host: str) -> List[Dict[str, Any]]:
+        """Return list of RDMA devices on host from cephadm list-rdma, or [] on error."""
+        try:
+            out = await self._run_cephadm_json(
+                host, 'mon', 'list-rdma', [], no_fsid=True,
+                log_output=self.mgr.log_refresh_metadata)
+            return out if isinstance(out, list) else []
+        except OrchestratorError as e:
+            self.log.error('Failed to get RDMA devices for host %s: %s', host, e)
+            return []
 
     def _refresh_host_osdspec_previews(self, host: str) -> Optional[str]:
         self.update_osdspec_previews(host)
@@ -862,8 +879,13 @@ class CephadmServe:
 
         try:
             all_slots, slots_to_add, daemons_to_remove = ha.place()
-            daemons_to_remove = [d for d in daemons_to_remove if (d.hostname and self.mgr.inventory._inventory[d.hostname].get(
-                'status', '').lower() not in ['maintenance', 'offline'] and d.hostname not in self.mgr.offline_hosts)]
+            daemons_to_remove = [
+                d for d in daemons_to_remove if (
+                    d.hostname
+                    and d.hostname in self.mgr.inventory._inventory
+                    and self.mgr.inventory._inventory.get(d.hostname, {}).get(
+                        'status', '').lower() not in ['maintenance', 'offline']
+                    and d.hostname not in self.mgr.offline_hosts)]
             self.log.debug('Add %s, remove %s' % (slots_to_add, daemons_to_remove))
         except OrchestratorError as e:
             msg = f'Failed to apply {spec.service_name()} spec {spec}: {str(e)}'
@@ -913,6 +935,9 @@ class CephadmServe:
         self.log.debug('Daemons that will be removed: %s' % daemons_to_remove)
 
         hosts_altered: Set[str] = set()
+
+        if service_type == 'nfs' and self.mgr.spec_store.needs_configuration(spec.service_name()):
+            svc.pre_daemon_service_config(spec)
 
         try:
             # assign names
@@ -1877,6 +1902,27 @@ class CephadmServe:
         self.log.info(f"Deploying cephadm binary to {host}")
         await self.mgr.ssh._write_remote_file(host, self.mgr.cephadm_binary_path,
                                               self.mgr._cephadm, addr=addr)
+
+    def _retry_failed_operations(self) -> None:
+        self.log.debug('_retry_failed_operations')
+        # retry nfs fencing for failed specs
+        failed_services = self.mgr.get_store('nfs_fencing_failed_services')
+        services = failed_services.split(',') if failed_services else []
+        to_remove = []
+        for service_name in services:
+            if service_name not in self.mgr.spec_store:
+                to_remove.append(service_name)
+                continue
+            spec = self.mgr.spec_store[service_name].spec
+            rank_map = self.mgr.spec_store[spec.service_name()].rank_map or {}
+            daemons = self.mgr.cache.get_daemons_by_service(service_name)
+            svc = service_registry.get_service('nfs')
+            self.log.debug('Retry NFS fence old rank for %s service', service_name)
+            svc.fence_old_ranks(spec, rank_map, len(daemons))
+        if to_remove:
+            self.log.debug('Remove NFS service from retry fence old ranks as services %s are removed', to_remove)
+            svc = cast(NFSService, service_registry.get_service('nfs'))
+            svc.update_failed_fencing_services_remove_missing(to_remove)
 
 
 def _host_selector(svc: Any) -> Optional[HostSelector]:

@@ -437,7 +437,7 @@ BuildRequires:	lz4-devel >= 1.7
 %if 0%{with make_check}
 BuildRequires:	golang
 %if 0%{?fedora} || 0%{?rhel} || 0%{?openEuler}
-BuildRequires:	golang-github-prometheus
+BuildRequires:	/usr/bin/promtool
 BuildRequires:	libtool-ltdl-devel
 BuildRequires:	xmlsec1
 BuildRequires:	xmlsec1-devel
@@ -1785,6 +1785,7 @@ exit 0
 %{_bindir}/cephfs-data-scan
 %{_bindir}/cephfs-journal-tool
 %{_bindir}/cephfs-table-tool
+%{_bindir}/cephfs-tool
 %{_bindir}/crushdiff
 %{_bindir}/rados
 %{_bindir}/radosgw-admin
@@ -2459,6 +2460,8 @@ fi
 %{_includedir}/rados/librados_fwd.hpp
 %{_includedir}/rados/page.h
 %{_includedir}/rados/rados_types.hpp
+%{_includedir}/rados/cls_flags.hpp
+%{_includedir}/rados/cls_traits.hpp
 
 %files -n python%{python3_pkgversion}-rados
 %{python3_sitearch}/rados.cpython*.so
@@ -2612,7 +2615,6 @@ fi
 %{_bindir}/ceph_perf_msgr_client
 %{_bindir}/ceph_perf_msgr_server
 %{_bindir}/ceph_psim
-%{_bindir}/ceph_radosacl
 %{_bindir}/ceph_rgw_jsonparser
 %{_bindir}/ceph_rgw_multiparser
 %{_bindir}/ceph_scratchtool

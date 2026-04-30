@@ -1,7 +1,7 @@
 import errno
+import re
 import json
 import logging
-import re
 import socket
 import time
 from abc import ABCMeta, abstractmethod
@@ -33,6 +33,14 @@ from orchestrator import (
 )
 from orchestrator._interface import daemon_type_to_service
 from cephadm import utils
+from ceph.cephadm.d3n_types import (
+    D3NCache,
+    D3NCacheError,
+    D3NCacheSpec,
+    d3n_get_host_devs,
+    d3n_paths,
+)
+from cephadm.services.rgw_d3n import D3NDevicePlanner
 from .service_registry import register_cephadm_service
 from cephadm.tlsobject_types import TLSObjectScope, TLSCredentials, EMPTY_TLS_CREDENTIALS
 from cephadm.ssl_cert_utils import extract_ips_and_fqdns_from_cert
@@ -883,6 +891,9 @@ class CephadmService(metaclass=ABCMeta):
     def get_blocking_daemon_hosts(self, service_name: str) -> List[HostSpec]:
         return []
 
+    def pre_daemon_service_config(self, spec: ServiceSpec) -> None:
+        return
+
     def has_placement_changed(self, deps: List[str], spec: ServiceSpec) -> bool:
         return False
 
@@ -1335,7 +1346,7 @@ class RgwService(CephService):
         if ssl_cert:
             if isinstance(ssl_cert, list):
                 ssl_cert = '\n'.join(ssl_cert)
-            deps.append(f'ssl-cert:{str(utils.md5_hash(ssl_cert))}')
+            deps.append(f'ssl-cert:{utils.config_hash(ssl_cert)}')
 
         return sorted(deps)
 
@@ -1374,21 +1385,80 @@ class RgwService(CephService):
             san_list = spec.zonegroup_hostnames or []
             hostnames = san_list + [f"*.{h}" for h in san_list] if spec.wildcard_enabled else san_list
 
-            zg_update_cmd = {
-                'prefix': 'rgw zonegroup modify',
-                'realm_name': spec.rgw_realm,
-                'zonegroup_name': spec.rgw_zonegroup,
-                'zone_name': spec.rgw_zone,
-                'hostnames': hostnames,
-            }
-            logger.debug(f'rgw cmd: {zg_update_cmd}')
-            ret, out, err = self.mgr.check_mon_command(zg_update_cmd)
+            # zonegroup modify requires explicit realm/zonegroup/zone identifiers.
+            # on single-site deployments, these values may be unset, avoid calling.
+            if not (spec.rgw_realm and spec.rgw_zonegroup and spec.rgw_zone):
+                logger.warning(
+                    f"Skipping 'rgw zonegroup modify' for {spec.service_name()}: "
+                    "zonegroup_hostnames is set but rgw_realm/rgw_zonegroup/rgw_zone "
+                    "were not provided in the spec."
+                )
+            else:
+                zg_update_cmd = {
+                    'prefix': 'rgw zonegroup modify',
+                    'realm_name': spec.rgw_realm,
+                    'zonegroup_name': spec.rgw_zonegroup,
+                    'zone_name': spec.rgw_zone,
+                    'hostnames': hostnames,
+                }
+                logger.debug(f'rgw cmd: {zg_update_cmd}')
+                ret, out, err = self.mgr.check_mon_command(zg_update_cmd)
 
         # TODO: fail, if we don't have a spec
         logger.info('Saving service %s spec with placement %s' % (
             spec.service_name(), spec.placement.pretty_str()))
         self.mgr.spec_store.save(spec)
         self.mgr.trigger_connect_dashboard_rgw()
+
+    def _compute_d3n_cache_for_daemon(
+        self,
+        daemon_spec: CephadmDaemonDeploySpec,
+        spec: RGWSpec,
+    ) -> Optional[D3NCache]:
+
+        alloc = D3NDevicePlanner(self.mgr)
+        d3n_raw = getattr(spec, 'd3n_cache', None)
+
+        if not d3n_raw:
+            return None
+
+        try:
+            d3n = D3NCacheSpec.from_json(d3n_raw)
+        except D3NCacheError as e:
+            raise OrchestratorError(str(e))
+
+        host = daemon_spec.host
+        if not host:
+            raise OrchestratorError("missing host in daemon_spec")
+
+        service_name = daemon_spec.service_name
+        daemon_details = [
+            dd for dd in self.mgr.cache.get_daemons_by_service(service_name)
+            if dd.hostname == host
+        ]
+
+        fs_type, size_bytes, devs = d3n_get_host_devs(d3n, host)
+        device = alloc.plan_device_for_daemon(service_name, host, devs, daemon_spec.daemon_id, daemon_details)
+
+        logger.info(
+            f"[D3N][alloc] service={service_name} host={host} daemon={daemon_spec.daemon_id} "
+            f"chosen={device} used=? devs={devs}"
+
+        )
+
+        if daemon_spec.daemon_id:
+            # warn if sharing is unavoidable
+            alloc.warn_if_sharing_unavoidable(service_name, host, devs)
+
+        mountpoint, cache_path = d3n_paths(self.mgr._cluster_fsid, device, daemon_spec.daemon_id)
+
+        return D3NCache(
+            device=device,
+            filesystem=fs_type,
+            size_bytes=size_bytes,
+            mountpoint=mountpoint,
+            cache_path=cache_path,
+        )
 
     def prepare_create(self, daemon_spec: CephadmDaemonDeploySpec) -> CephadmDaemonDeploySpec:
         assert self.TYPE == daemon_spec.daemon_type
@@ -1550,6 +1620,36 @@ class RgwService(CephService):
         daemon_spec.keyring = keyring
         daemon_spec.final_config, daemon_spec.deps = self.generate_config(daemon_spec)
 
+        d3n_cache = daemon_spec.final_config.get('d3n_cache')
+
+        if d3n_cache:
+            try:
+                d3n = D3NCache.from_json(d3n_cache)
+            except D3NCacheError as e:
+                raise OrchestratorError(str(e))
+
+            cache_path = d3n.cache_path
+            size = d3n.size_bytes
+
+            self.mgr.check_mon_command({
+                'prefix': 'config set',
+                'who': daemon_name,
+                'name': 'rgw_d3n_l1_local_datacache_enabled',
+                'value': 'true',
+            })
+            self.mgr.check_mon_command({
+                'prefix': 'config set',
+                'who': daemon_name,
+                'name': 'rgw_d3n_l1_datacache_persistent_path',
+                'value': cache_path,
+            })
+            self.mgr.check_mon_command({
+                'prefix': 'config set',
+                'who': daemon_name,
+                'name': 'rgw_d3n_l1_datacache_size',
+                'value': str(size),
+            })
+
         return daemon_spec
 
     def get_keyring(self, rgw_id: str) -> str:
@@ -1583,11 +1683,28 @@ class RgwService(CephService):
             'who': utils.name_to_config_section(daemon.name()),
             'name': 'rgw_frontends',
         })
+
+        self.mgr.check_mon_command({
+            'prefix': 'config rm',
+            'who': utils.name_to_config_section(daemon.name()),
+            'name': 'rgw_d3n_l1_local_datacache_enabled',
+        })
+        self.mgr.check_mon_command({
+            'prefix': 'config rm',
+            'who': utils.name_to_config_section(daemon.name()),
+            'name': 'rgw_d3n_l1_datacache_persistent_path',
+        })
+        self.mgr.check_mon_command({
+            'prefix': 'config rm',
+            'who': utils.name_to_config_section(daemon.name()),
+            'name': 'rgw_d3n_l1_datacache_size',
+        })
         self.mgr.check_mon_command({
             'prefix': 'config rm',
             'who': utils.name_to_config_section(daemon.name()),
             'name': 'qat_compressor_enabled'
         })
+
         self.mgr.check_mon_command({
             'prefix': 'config-key rm',
             'key': f'rgw/cert/{daemon.name()}',
@@ -1640,6 +1757,10 @@ class RgwService(CephService):
 
         if svc_spec.qat:
             config['qat'] = svc_spec.qat
+
+        d3n_cache = self._compute_d3n_cache_for_daemon(daemon_spec, svc_spec)
+        if d3n_cache:
+            config['d3n_cache'] = d3n_cache.to_json()
 
         rgw_deps = parent_deps + self.get_dependencies(self.mgr, svc_spec)
         return config, rgw_deps

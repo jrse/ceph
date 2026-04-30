@@ -1,6 +1,6 @@
 import json
 import logging
-from asyncio import gather
+from asyncio import gather, to_thread
 from threading import Lock
 from typing import List, Dict, Any, Set, Tuple, cast, Optional, TYPE_CHECKING
 
@@ -115,6 +115,17 @@ class OSDService(CephService):
         if replace_osd_ids is None:
             replace_osd_ids = OsdIdClaims(self.mgr).filtered_by_host(host)
             assert replace_osd_ids is not None
+
+        # ceph-volume registers new OSDs with the monitor before returning.
+        # the mgr's view of the osd map can briefly lag, so get_osd_uuid_map()
+        # would miss the new id and we would skip deploying the cephadm
+        # daemon (misleading "Created no osd(s)" while the osd exists but is still down).
+        # wait_for_latest_osdmap() is synchronous:
+        # We need to run it in a thread pool so we do not block the cephadm asyncio event loop.
+        ret = await to_thread(self.mgr.rados.wait_for_latest_osdmap)
+        if ret < 0:
+            raise OrchestratorError(
+                'wait_for_latest_osdmap failed with %d' % ret)
 
         # check result: lvm
         osds_elems: dict = await CephadmServe(self.mgr)._run_cephadm_json(
@@ -946,10 +957,12 @@ class OSDRemovalQueue(object):
                 logger.info(f"Successfully purged {osd} on {osd.hostname}")
 
             if osd.zap:
-                # throws an exception if the zap fails
-                logger.info(f"Zapping devices for {osd} on {osd.hostname}")
-                osd.do_zap()
-                logger.info(f"Successfully zapped devices for {osd} on {osd.hostname}")
+                try:
+                    logger.info(f"Zapping devices for {osd} on {osd.hostname}")
+                    osd.do_zap()
+                    logger.info(f"Successfully zapped devices for {osd} on {osd.hostname}")
+                except Exception:
+                    logger.exception(f"Failed to zap devices for {osd} on {osd.hostname}")
             self.mgr.cache.invalidate_host_devices(osd.hostname)
             logger.debug(f"Removing {osd} from the queue.")
 

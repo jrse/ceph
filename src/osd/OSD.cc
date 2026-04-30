@@ -39,6 +39,7 @@
 #include <sys/mount.h>
 #endif
 
+#include "mgr/DaemonHealthMetric.h" // for enum daemon_metric
 #include "osd/PG.h"
 #include "osd/scrubber/scrub_machine.h"
 #include "osd/scrubber/pg_scrubber.h"
@@ -1474,18 +1475,17 @@ MOSDMap *OSDService::build_incremental_map_msg(epoch_t since, epoch_t to,
     // send what we have so far
     return m;
   }
-  // send something
+  // send something if we can
   bufferlist bl;
   if (get_inc_map_bl(m->newest_map, bl)) {
     m->incremental_maps[m->newest_map] = std::move(bl);
-  } else {
-    derr << __func__ << " unable to load latest map " << m->newest_map << dendl;
-    if (!get_map_bl(m->newest_map, bl)) {
-      derr << __func__ << " unable to load latest full map " << m->newest_map
-	   << dendl;
-      ceph_abort();
-    }
+  } else if (get_map_bl(m->newest_map, bl)) {
     m->maps[m->newest_map] = std::move(bl);
+  } else {
+    derr << __func__ << " unable to load latest map " << m->newest_map
+	 << ", sending empty map message (peer will drop or re-request from mon)"
+	 << dendl;
+
   }
   return m;
 }

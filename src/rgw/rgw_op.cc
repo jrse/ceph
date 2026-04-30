@@ -475,6 +475,8 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
       return -ENOENT;
     }
 
+    s->env.emplace("s3:prefix", object->get_name());
+
     if (verify_bucket_permission(dpp, s, bucket->get_key(), s->user_acl,
                                  bucket_policy, policy, s->iam_identity_policies,
                                  s->session_policies, rgw::IAM::s3ListBucket)) {
@@ -2783,10 +2785,6 @@ void RGWGetObj::execute(optional_yield y)
     goto done_err;
   total_len = (ofs <= end ? end + 1 - ofs : 0);
 
-  ofs_x = ofs;
-  end_x = end;
-  filter->fixup_range(ofs_x, end_x);
-
   /* Check whether the object has expired. Swift API documentation
    * stands that we should return 404 Not Found in such case. */
   if (need_object_expiration() && s->object->is_expired()) {
@@ -2804,11 +2802,14 @@ void RGWGetObj::execute(optional_yield y)
                                     attr_iter != attrs.end() ? &(attr_iter->second) : nullptr);
   if (decrypt != nullptr) {
     filter = decrypt.get();
-    filter->fixup_range(ofs_x, end_x);
   }
   if (op_ret < 0) {
     goto done_err;
   }
+
+  ofs_x = ofs;
+  end_x = end;
+  filter->fixup_range(ofs_x, end_x);
 
 
   if (!get_data || ofs > end) {
@@ -5946,7 +5947,7 @@ public:
     }
 
     bool src_encrypted = s->src_object->get_attrs().count(RGW_ATTR_CRYPT_MODE);
-    if (need_decompress && !src_encrypted) {
+    if (need_decompress) {
       obj_size = decompress_info.orig_size;
       s->src_object->set_obj_size(obj_size);
       static constexpr bool partial_content = false;
@@ -7436,13 +7437,22 @@ void RGWCompleteMultipart::execute(optional_yield y)
 
   serializer = meta_obj->get_serializer(this, y, "RGWCompleteMultipart");
   op_ret = serializer->try_lock(this, dur, y);
-  if (op_ret < 0) {
-    ldpp_dout(this, 0) << "failed to acquire lock" << dendl;
-    if (op_ret == -ENOENT && check_previously_completed(parts)) {
-      ldpp_dout(this, 1) << "NOTICE: This multipart completion is already completed" << dendl;
+  if (op_ret == -ENOENT) {
+    // CompleteMultipartUpload should be idempotent - return success if the
+    // upload already completed. but note that this check isn't reliable in
+    // cases where the upload completed successfully but was later overwritten
+    // or deleted
+    if (check_previously_completed(parts)) {
+      ldpp_dout(this, 4) << "NOTICE: This multipart completion is already completed" << dendl;
       op_ret = 0;
       return;
     }
+    s->err.message = "The specified multipart upload does not exist.";
+    op_ret = -ERR_NO_SUCH_UPLOAD;
+    return;
+  }
+  if (op_ret < 0) {
+    ldpp_dout(this, 0) << "failed to acquire lock" << dendl;
     op_ret = -ERR_INTERNAL_ERROR;
     s->err.message = "This multipart completion is already in progress";
     return;

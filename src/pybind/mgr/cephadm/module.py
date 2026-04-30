@@ -62,7 +62,7 @@ from mgr_module import (
     NotifyType,
     MonCommandFailed,
 )
-from mgr_util import build_url
+from mgr_util import build_url, NvmeofMetadataPoolHelper
 import orchestrator
 from orchestrator.module import to_format, Format
 
@@ -2988,13 +2988,16 @@ Then run the following:
         osd_map = self.get('osd_map')
         r = {}
         for o in osd_map['osds']:
-            # only include OSDs that have ever started in this map.  this way
-            # an interrupted osd create can be repeated and succeed the second
-            # time around.
+            # when only_up, only include OSDs that are currently up, so we do not
+            # treat a "just created" (still down) osd as "already present" for
+            # deploy_osd_daemons_for_existing_osds().
             osd_id = o.get('osd')
             if osd_id is None:
                 raise OrchestratorError("Could not retrieve osd_id from osd_map")
-            if not only_up:
+            if only_up:
+                if o.get('up') == 1:
+                    r[str(osd_id)] = o.get('uuid', '')
+            else:
                 r[str(osd_id)] = o.get('uuid', '')
         return r
 
@@ -3922,6 +3925,8 @@ Then run the following:
             nvmeof_spec = cast(NvmeofServiceSpec, spec)
             assert nvmeof_spec.pool is not None, "Pool cannot be None for nvmeof services"
             assert nvmeof_spec.service_id is not None  # for mypy
+            if nvmeof_spec.pool == '.nvmeof':
+                NvmeofMetadataPoolHelper(self).create_pool_if_needed()
             try:
                 self._check_pool_exists(nvmeof_spec.pool, nvmeof_spec.service_name())
             except OrchestratorError as e:
@@ -4166,6 +4171,9 @@ Then run the following:
         if daemon_types is not None and services is not None:
             raise OrchestratorError('--daemon-types and --services are mutually exclusive')
         if daemon_types is not None:
+            # Strip any whitespace around daemon types provided via the CLI so that
+            # `--daemon_types "mon, crash"` is treated the same as `--daemon_types "mon,crash"`.
+            daemon_types = [dtype.strip() for dtype in daemon_types]
             for dtype in daemon_types:
                 if dtype not in utils.CEPH_IMAGE_TYPES:
                     raise OrchestratorError(f'Upgrade aborted - Got unexpected daemon type "{dtype}".\n'

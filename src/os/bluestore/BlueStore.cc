@@ -5061,6 +5061,68 @@ void BlueStore::Onode::finish_write(TransContext* txc, uint32_t offset, uint32_t
   ldout(c->store->cct, 10) << __func__ << " done " << txc << dendl;
 }
 
+struct FragMetric {
+  // Computes fragmentation as the number of disjoint segments
+  // produced by a stream of mapped ranges.
+  // frag_score == current disjoint segment count.
+
+  std::unordered_set<uint64_t> endpoints;
+  uint64_t frag_score = 0;
+
+  FragMetric() {}
+
+  inline void note(uint64_t offset, uint64_t length) {
+    bool merge_left = endpoints.count(offset);
+    bool merge_right = endpoints.count(offset + length);
+    if (merge_left && merge_right) {
+      endpoints.erase(offset);
+      endpoints.erase(offset + length);
+      frag_score--;
+    } else if (merge_left) {
+      endpoints.erase(offset);
+      endpoints.insert(offset + length);
+    } else if (merge_right) {
+      endpoints.erase(offset + length);
+      endpoints.insert(offset);
+    } else {
+      endpoints.insert(offset);
+      endpoints.insert(offset + length);
+      frag_score++;
+    }
+  }
+};
+
+int BlueStore::Onode::get_fragmentation_score()
+{
+  FragMetric frag;
+
+  std::unordered_set<BlobRef> visited_compressed_blobs;
+
+  for (const auto& e : extent_map.extent_map) {
+    if (e.blob->get_blob().is_compressed()) {
+      if (visited_compressed_blobs.insert(e.blob).second) {
+        e.blob->get_blob().map(
+          0, e.blob->get_blob().get_ondisk_length(),
+          [&](uint64_t offset, uint64_t length) {
+            frag.note(offset, length);
+            return 0;
+          }
+        );
+      }
+    } else {
+      e.blob->get_blob().map(
+        e.blob_offset,
+        e.length,
+        [&](uint64_t phys_offset, uint64_t len) {
+          frag.note(phys_offset, len);
+          return 0;
+        }
+      );
+    }
+  }
+  return frag.frag_score;
+}
+
 // =======================================================
 // WriteContext
  
@@ -6639,6 +6701,19 @@ void BlueStore::_init_logger()
     "bsal",
     PerfCountersBuilder::PRIO_USEFUL);
 
+  // Fragmentation Tracking counters
+  //****************************************
+  b.add_time_avg(l_bluestore_runtime_frag_lat,
+    "runtime_frag_lat",
+    "Latency of runtime fragmentation measurement",
+    "rfl",
+    PerfCountersBuilder::PRIO_USEFUL);
+  b.add_time_avg(l_bluestore_static_frag_lat,
+    "static_frag_lat",
+    "Latency of static fragmentation measurement during scrub",
+    "sfl",
+    PerfCountersBuilder::PRIO_USEFUL);
+
   logger = b.create_perf_counters();
   cct->get_perfcounters_collection()->add(logger);
 }
@@ -7186,6 +7261,7 @@ int BlueStore::_open_bdev(bool create)
 
   if (!create && cct->_conf->bluestore_use_ebd) {
     // for regular bdev opens check if it was deployed with plugin
+    ebd_health_alert.clear();
     string meta_plugin_id;
     r = read_meta("extblkdev", &meta_plugin_id);
     if (r == 0) {
@@ -7196,20 +7272,16 @@ int BlueStore::_open_bdev(bool create)
         derr << "Failed preloading extblkdev plugins, error code: " << plugin_preload_r << dendl;
       }
       string bdev_plugin_id;
-      r = bdev->get_ebd_id(bdev_plugin_id);
-      bool is_osd = cct->get_module_type() & CEPH_ENTITY_TYPE_OSD;
+      r = bdev->detect_ebd(bdev_plugin_id);
       if (r != 0) {
+        ebd_health_alert = "plugin '" + meta_plugin_id + "' not loaded";
         derr << __func__ << " plugin " << meta_plugin_id << " not loaded" << dendl;
-        if (is_osd) {
-          goto fail_close;
-        }
       } else {
         if (meta_plugin_id != bdev_plugin_id) {
+          ebd_health_alert = " plugin '" + meta_plugin_id + "' used on mkfs, "
+            "but now uses plugin '" + bdev_plugin_id + "'";
           derr << __func__ << " plugin '" << meta_plugin_id << "' used on mkfs, "
             << "but now uses plugin '" << bdev_plugin_id << "'" << dendl;
-          if (is_osd) {
-            goto fail_close;
-          }
         }
       }
     }
@@ -7304,12 +7376,6 @@ int BlueStore::_open_fm(KeyValueDB::Transaction t,
     ceph_assert(cct->_conf->bdev_block_size <= min_alloc_size);
 
     uint64_t alloc_size = min_alloc_size;
-    if (!bdev->is_smr() && freelist_type == "zoned") {
-      derr << "non-SMR device (or SMR support not built-in) but freelist_type = zoned"
-	   << dendl;
-      return -EINVAL;
-    }
-
     fm->create(bdev->get_size(), alloc_size, t);
 
     auto reserved = _get_ondisk_reserved();
@@ -8677,7 +8743,7 @@ int BlueStore::mkfs()
   if (cct->_conf->bluestore_use_ebd) {
     // check if EBD plugin is enabled
     string plugin_id;
-    r = bdev->get_ebd_id(plugin_id);
+    r = bdev->detect_ebd(plugin_id);
     if (r == 0) {
       // retrieved name, save plugin into bdev metadata
       r = write_meta("extblkdev", plugin_id);
@@ -12988,6 +13054,50 @@ int BlueStore::_generate_read_result_bl(
   return 0;
 }
 
+void BlueStore::_measure_runtime_frag(
+  Collection *c,
+  const blobs2read_t& blobs2read)
+{
+  auto start = mono_clock::now();
+  FragMetric frag;
+  for (auto& p : blobs2read) {
+    const BlobRef& bptr = p.first;
+    const regions2read_t& r2r = p.second;
+    for (auto req : r2r) {
+      bptr->get_blob().map(
+        req.r_off, req.r_len,
+        [&](uint64_t offset, uint64_t length) {
+          frag.note(offset, length);
+          return 0;
+        });
+    }
+  }
+  if (frag.frag_score > 0) {
+    c->runtime_read_samples.fetch_add(1, std::memory_order_relaxed);
+    c->runtime_frag_count.fetch_add(frag.frag_score, std::memory_order_relaxed);
+  }
+  auto finish = mono_clock::now();
+  logger->tinc_with_max(l_bluestore_runtime_frag_lat, finish - start);
+}
+
+void BlueStore::_measure_static_frag(
+  Collection *c,
+  const OnodeRef& o)
+{
+  auto start = mono_clock::now();
+  auto read_samples = c->object_read_samples.load(std::memory_order_relaxed);
+  auto frag_score = o->get_fragmentation_score();
+  if (read_samples == 0) {
+    c->static_frag_score.store(frag_score, std::memory_order_relaxed);
+    c->object_read_samples.store(1, std::memory_order_relaxed);
+  } else {
+    c->static_frag_score.fetch_add(frag_score, std::memory_order_relaxed);
+    c->object_read_samples.fetch_add(1, std::memory_order_relaxed);
+  }
+  auto finish = mono_clock::now();
+  logger->tinc_with_max(l_bluestore_static_frag_lat, finish - start);
+}
+
 int BlueStore::_do_read(
   Collection *c,
   OnodeRef& o,
@@ -13088,6 +13198,21 @@ int BlueStore::_do_read(
       [&](auto lat) { return ", num_ios = " + stringify(num_ios); },
       l_bluestore_slow_read_wait_aio_count
     );
+  }
+
+  if (cct->_conf->bluestore_frag_runtime) {
+    _measure_runtime_frag(c, blobs2read);
+  }
+
+  if ((op_flags & CEPH_OSD_OP_FLAG_SCRUB) && cct->_conf->bluestore_frag_static) {
+    if (!o->extent_map.extent_map.empty()) {
+      o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+      auto it = o->extent_map.extent_map.begin();
+      uint64_t first_extent_offset = it->logical_offset;
+      if (offset <= first_extent_offset && first_extent_offset < offset + length) {
+        _measure_static_frag(c, o);
+      }
+    }
   }
 
   bool csum_error = false;
@@ -13453,6 +13578,9 @@ int BlueStore::_do_readv(
     // we always issue aio for reading, so errors other than EIO are not allowed
     if (r < 0)
       return r;
+    if (cct->_conf->bluestore_frag_runtime) {
+      _measure_runtime_frag(c, std::get<2>(raw_results[i]));
+    }
   }
 
   auto num_ios = m.size();
@@ -13483,6 +13611,24 @@ int BlueStore::_do_readv(
       [&](auto lat) { return ", num_ios = " + stringify(num_ios); },
       l_bluestore_slow_read_wait_aio_count
     );
+  }
+
+  if ((op_flags & CEPH_OSD_OP_FLAG_SCRUB) && cct->_conf->bluestore_frag_static) {
+    if (!o->extent_map.extent_map.empty()) {
+      o->extent_map.fault_range(db, 0, OBJECT_MAX_SIZE);
+      auto it = o->extent_map.extent_map.begin();
+      uint64_t first_extent_offset = it->logical_offset;
+      for (auto& p : m) {
+        uint64_t off = p.first;
+        uint64_t len = p.second;
+
+        if (off <= first_extent_offset &&
+            first_extent_offset < off + len) {
+          _measure_static_frag(c, o);
+          break;
+        }
+      }
+    }
   }
 
   ceph_assert(raw_results.size() == (size_t)m.num_intervals());
@@ -19571,6 +19717,13 @@ void BlueStore::_log_alerts(osd_alert_list_t& alerts)
     cct->_conf.get_val<double>("bluestore_warn_on_free_fragmentation") * 1e6) {
     alerts.emplace("BLUESTORE_FREE_FRAGMENTATION",
       fmt::format("{0:.6f}", logger->get(l_bluestore_fragmentation) * 1e-6));
+  }
+  if (!ebd_health_alert.empty()) {
+    std::string& v = alerts["EXTBLKDEV"];
+    if (!v.empty()) {
+      v += "; ";
+    }
+    v.append(ebd_health_alert);
   }
 }
 
