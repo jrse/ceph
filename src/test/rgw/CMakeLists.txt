@@ -278,6 +278,19 @@ if(WITH_RADOSGW_AMQP_ENDPOINT)
   target_link_libraries(unittest_rgw_amqp ${rgw_libs})
 endif()
 
+if(WITH_RADOSGW_KAFKA_ENDPOINT)
+  add_library(kafka_mock STATIC kafka_mock.cc)
+  target_include_directories(kafka_mock
+    PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+  add_executable(unittest_rgw_kafka test_rgw_kafka.cc)
+  add_ceph_unittest(unittest_rgw_kafka)
+  target_include_directories(unittest_rgw_kafka
+    SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+  target_link_libraries(unittest_rgw_kafka
+    rgw_common kafka_mock
+    global ${UNITTEST_LIBS})
+endif()
+
 # unittest_rgw_xml
 add_executable(unittest_rgw_xml test_rgw_xml.cc)
 add_ceph_unittest(unittest_rgw_xml)
