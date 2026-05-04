@@ -4631,6 +4631,8 @@ def kafka_security(security_type, mechanism='PLAIN', use_topic_attrs_for_creds=F
             endpoint_address = 'kafka://' + default_kafka_server + ':9094'
     elif security_type == 'SSL':
         endpoint_address = 'kafka://' + default_kafka_server + ':9093'
+    elif security_type == 'MTLS':
+        endpoint_address = 'kafka://' + default_kafka_server + ':9093'
     elif security_type == 'SASL_PLAINTEXT':
         endpoint_address = 'kafka://alice:alice-secret@' + default_kafka_server + ':9095'
     else:
@@ -4643,6 +4645,11 @@ def kafka_security(security_type, mechanism='PLAIN', use_topic_attrs_for_creds=F
         endpoint_args = 'push-endpoint='+endpoint_address+'&kafka-ack-level=broker&use-ssl=true&ca-location='+KAFKA_DIR+'/y-ca.crt&mechanism='+mechanism
         if use_topic_attrs_for_creds:
             endpoint_args += '&user-name=alice&password=alice-secret'
+    elif security_type == 'MTLS':
+        KAFKA_DIR = os.environ['KAFKA_DIR']
+        endpoint_args = 'push-endpoint='+endpoint_address+'&kafka-ack-level=broker&use-ssl=true&ca-location='+KAFKA_DIR+'/y-ca.crt'
+        endpoint_args += '&ssl-certificate-location='+KAFKA_DIR+'/client.crt'
+        endpoint_args += '&ssl-key-location='+KAFKA_DIR+'/client.key'
     else:
         KAFKA_DIR = os.environ['KAFKA_DIR']
         endpoint_args = 'push-endpoint='+endpoint_address+'&kafka-ack-level=broker&use-ssl=true&ca-location='+KAFKA_DIR+'/y-ca.crt'
@@ -4650,7 +4657,9 @@ def kafka_security(security_type, mechanism='PLAIN', use_topic_attrs_for_creds=F
     topic_conf = PSTopicS3(conn, topic_name, zonegroup, endpoint_args=endpoint_args)
 
     # create consumer on the topic
-    task, receiver = create_kafka_receiver_thread(topic_name, security_type=security_type, mechanism=mechanism)
+    # MTLS uses the same SSL listener as SSL, so consumer treats it as SSL
+    receiver_security_type = 'SSL' if security_type == 'MTLS' else security_type
+    task, receiver = create_kafka_receiver_thread(topic_name, security_type=receiver_security_type, mechanism=mechanism)
     task.start()
     verify_kafka_receiver(receiver)
 
@@ -4744,6 +4753,12 @@ def test_notification_kafka_security_sasl_scram_512():
 @pytest.mark.kafka_security_test
 def test_notification_kafka_security_ssl_sasl_scram_512():
     kafka_security('SASL_SSL', mechanism='SCRAM-SHA-512')
+
+
+@pytest.mark.kafka_security_test
+def test_notification_kafka_security_mtls():
+    """test mTLS client certificate authentication to Kafka"""
+    kafka_security('MTLS')
 
 
 @pytest.mark.http_test
