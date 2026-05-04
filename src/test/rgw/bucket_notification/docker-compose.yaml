@@ -1,0 +1,117 @@
+# Kafka broker for RGW bucket notification integration tests.
+#
+# Provides all authentication methods:
+#   - Port 9092: PLAINTEXT (no auth)
+#   - Port 9093: SSL / mTLS (client cert auth)
+#   - Port 9094: INTERNAL PLAINTEXT (container-to-container)
+#   - Port 9095: SASL_PLAINTEXT (SCRAM-SHA-512)
+#   - Port 9096: SASL_SSL (SCRAM-SHA-512 + TLS)
+#
+# Usage:
+#   1. Generate certs:  bash kafka-security.sh
+#   2. Start broker:    docker-compose up -d
+#   3. Run tests:       KAFKA_DIR=$(pwd) python -m pytest test_bn.py -m kafka_security_test
+#   4. Teardown:        docker-compose down
+
+services:
+  broker:
+    image: confluentinc/cp-kafka:7.9.0
+    hostname: broker
+    container_name: broker
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+      - "9094:9094"
+      - "9095:9095"
+      - "9096:9096"
+    volumes:
+      - ./:/etc/kafka/secrets:ro
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@localhost:29093'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+
+      # --- Listeners ---
+      KAFKA_LISTENERS: >-
+        PLAINTEXT://0.0.0.0:29092,
+        PLAINTEXT_HOST://0.0.0.0:9092,
+        INTERNAL://0.0.0.0:9094,
+        SASL_PLAINTEXT://0.0.0.0:9095,
+        SASL_SSL://0.0.0.0:9096,
+        SSL://0.0.0.0:9093,
+        CONTROLLER://127.0.0.1:29093
+      KAFKA_ADVERTISED_LISTENERS: >-
+        PLAINTEXT://127.0.0.1:29092,
+        PLAINTEXT_HOST://broker:9092,
+        INTERNAL://host.containers.internal:9094,
+        SASL_PLAINTEXT://broker:9095,
+        SASL_SSL://broker:9096,
+        SSL://broker:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: >-
+        CONTROLLER:PLAINTEXT,
+        PLAINTEXT:PLAINTEXT,
+        PLAINTEXT_HOST:PLAINTEXT,
+        INTERNAL:PLAINTEXT,
+        SASL_PLAINTEXT:SASL_PLAINTEXT,
+        SASL_SSL:SASL_SSL,
+        SSL:SSL
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+
+      # --- SASL / SCRAM ---
+      KAFKA_SASL_ENABLED_MECHANISMS: 'SCRAM-SHA-512'
+      KAFKA_SASL_MECHANISM_INTER_BROKER_PROTOCOL: 'PLAINTEXT'
+      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_SCRAM___SHA___512_SASL_JAAS_CONFIG: >-
+        org.apache.kafka.common.security.scram.ScramLoginModule required;
+      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_SASL_ENABLED_MECHANISMS: 'SCRAM-SHA-512'
+      KAFKA_LISTENER_NAME_SASL__SSL_SCRAM___SHA___512_SASL_JAAS_CONFIG: >-
+        org.apache.kafka.common.security.scram.ScramLoginModule required;
+      KAFKA_LISTENER_NAME_SASL__SSL_SASL_ENABLED_MECHANISMS: 'SCRAM-SHA-512'
+
+      # --- KAFKA_OPTS ---
+      KAFKA_OPTS: '-Djava.security.auth.login.config=/etc/kafka/secrets/kafka_server_jaas.conf'
+
+      # --- SSL (broker cert + mTLS client auth) ---
+      KAFKA_SSL_KEYSTORE_FILENAME: 'server.keystore.jks'
+      KAFKA_SSL_KEYSTORE_CREDENTIALS: 'ssl_credentials'
+      KAFKA_SSL_KEY_CREDENTIALS: 'ssl_credentials'
+      KAFKA_SSL_TRUSTSTORE_FILENAME: 'server.truststore.jks'
+      KAFKA_SSL_TRUSTSTORE_CREDENTIALS: 'ssl_credentials'
+      KAFKA_SSL_CLIENT_AUTH: 'required'
+
+      # --- Topic defaults ---
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+
+      # --- Disable telemetry ---
+      CONFLUENT_SUPPORT_CUSTOMER_ID: 'anonymous'
+
+  # One-shot container to create SCRAM users after broker is up
+  kafka-init:
+    image: confluentinc/cp-kafka:7.9.0
+    container_name: kafka-init
+    depends_on:
+      - broker
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Waiting for broker to be ready..."
+        cub kafka-ready -b broker:9092 1 60
+
+        echo "Creating SCRAM-SHA-512 user: alice"
+        kafka-configs --bootstrap-server broker:9092 \
+          --alter --add-config 'SCRAM-SHA-512=[password=alice-secret]' \
+          --entity-type users --entity-name alice
+
+        echo "Creating SCRAM-SHA-512 user: admin"
+        kafka-configs --bootstrap-server broker:9092 \
+          --alter --add-config 'SCRAM-SHA-512=[password=admin-secret]' \
+          --entity-type users --entity-name admin
+
+        echo "SCRAM users created successfully."

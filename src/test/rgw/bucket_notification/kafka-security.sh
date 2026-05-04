@@ -61,3 +61,25 @@ echo "########## store certificate '$CERTFILE' in key store '$KEYFILE'"
 keytool -storepass $MYPW -keystore $KEYFILE -alias localhost \
   -import -file $CERTFILE
 
+echo "########## generate client certificate for mTLS testing"
+CLIENT_KEYFILE=client.key
+CLIENT_CERTFILE=client.crt
+CLIENT_REQFILE=client.req
+
+# generate client private key (PKCS#8 for compatibility)
+openssl genpkey -algorithm RSA -out $CLIENT_KEYFILE -pkeyopt rsa_keygen_bits:2048
+
+# generate client CSR
+openssl req -new -key $CLIENT_KEYFILE -out $CLIENT_REQFILE \
+  -subj '/CN=rgw-client/OU=Testing/O=Ceph/C=US'
+
+# sign client cert with our CA
+openssl x509 -req -CA $CAFILE -CAkey $CAKEYFILE -CAcreateserial \
+  -days $VALIDITY -in $CLIENT_REQFILE -out $CLIENT_CERTFILE -sha256
+
+rm -f $CLIENT_REQFILE
+
+echo "########## import client CA into truststore (so broker trusts client certs)"
+keytool -keystore $TRUSTFILE -storepass $MYPW -alias ClientCA \
+  -noprompt -importcert -file $CAFILE 2>/dev/null || true
+

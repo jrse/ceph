@@ -63,6 +63,85 @@ After running `vstart.sh`, Zookeeper, and Kafka services you're ready to run the
 Kafka Security Tests
 --------------------
 
+There are two options for running the Kafka security tests: using the provided
+Docker environment (recommended) or manually configuring a Kafka broker.
+
+Option A: Docker-Based Test Environment (Recommended)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``docker-compose.yaml`` and setup script are provided to create a fully
+configured Kafka broker with all authentication methods available.
+
+**Prerequisites:**
+
+- Docker or Podman with docker-compose/podman-compose
+- ``openssl`` and ``keytool`` (from ``java-*-openjdk-headless``)
+- RGW running (e.g., via ``vstart.sh``)
+
+**Setup:**
+
+1. Start the Kafka test environment::
+
+        cd /path/to/ceph/src/test/rgw/bucket_notification
+        bash setup-kafka-test-env.sh
+
+   This script will:
+
+   - Generate SSL certificates (CA, broker keystores, client cert for mTLS)
+   - Start the Kafka broker via docker-compose
+   - Create SCRAM users (``alice/alice-secret``, ``admin/admin-secret``)
+
+2. Start RGW with cleartext secrets allowed::
+
+        cd /path/to/ceph/build
+        MON=1 OSD=1 MDS=0 MGR=0 RGW=1 ../src/vstart.sh -n -d \
+            -o "rgw_allow_notification_secrets_in_cleartext=true"
+
+3. Run the security tests::
+
+        cd /path/to/ceph
+        KAFKA_DIR=/path/to/ceph/src/test/rgw/bucket_notification \
+        BNTESTS_CONF=/path/to/bntests.conf \
+            python -m pytest -s src/test/rgw/bucket_notification/test_bn.py -v -m 'kafka_security_test'
+
+   To run only the mTLS test::
+
+        KAFKA_DIR=/path/to/ceph/src/test/rgw/bucket_notification \
+        BNTESTS_CONF=/path/to/bntests.conf \
+            python -m pytest -s src/test/rgw/bucket_notification/test_bn.py::test_notification_kafka_security_mtls -v
+
+4. Teardown::
+
+        cd /path/to/ceph/src/test/rgw/bucket_notification
+        docker-compose down
+
+**Available listeners:**
+
++-------------------+------+---------------------------------------+
+| Protocol          | Port | Authentication                        |
++===================+======+=======================================+
+| PLAINTEXT         | 9092 | None                                  |
++-------------------+------+---------------------------------------+
+| SSL (mTLS)        | 9093 | Client certificate (mutual TLS)       |
++-------------------+------+---------------------------------------+
+| INTERNAL          | 9094 | None (container-to-container)         |
++-------------------+------+---------------------------------------+
+| SASL_PLAINTEXT    | 9095 | SCRAM-SHA-512                         |
++-------------------+------+---------------------------------------+
+| SASL_SSL          | 9096 | SCRAM-SHA-512 + TLS                   |
++-------------------+------+---------------------------------------+
+
+**Generated certificates:**
+
+- ``y-ca.crt`` — CA certificate (used as ``ca-location`` in RGW topics)
+- ``client.crt`` — Client certificate for mTLS (used as ``ssl-certificate-location``)
+- ``client.key`` — Client private key for mTLS (used as ``ssl-key-location``)
+- ``server.keystore.jks`` — Kafka broker keystore
+- ``server.truststore.jks`` — Kafka broker truststore (contains CA)
+
+Option B: Manual Kafka Configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 1. First generate SSL certificates::
 
         cd /path/to/kafka/
@@ -182,3 +261,29 @@ To run the RabbitMQ SSL security tests use the following::
 During these tests, the test script will restart the RabbitMQ server with the correct security configuration (``sudo`` privileges will be needed).
 For that reason it is not recommended to run the `amqp_ssl_test` tests, that assumes a manually configured rabbirmq server, in the same run as `amqp_test` tests, 
 that assume the rabbitmq daemon running on the host as a service.
+
+=========================
+Kafka Unit Tests (C++)
+=========================
+
+The ``unittest_rgw_kafka`` test suite validates the Kafka connection configuration
+logic without requiring a running Kafka broker. It uses a ``kafka_mock`` library
+that intercepts librdkafka API calls and records the configuration properties
+passed to ``rd_kafka_conf_set()``.
+
+**Build and run**::
+
+        cd /path/to/ceph/build
+        ninja unittest_rgw_kafka
+        ./bin/unittest_rgw_kafka
+
+**Test coverage:**
+
+- Plaintext connections (no security protocol)
+- SSL connections (``security.protocol=SSL``, ``ssl.ca.location``)
+- mTLS connections (``ssl.certificate.location``, ``ssl.key.location``, ``ssl.key.password``)
+- SASL_PLAINTEXT (SCRAM-SHA-512)
+- SASL_SSL (SCRAM-SHA-512 + TLS)
+- Combined SASL_SSL + mTLS
+- Connection reuse (same parameters reuse existing connection)
+- Connection identity (different certs/protocols create separate connections)
