@@ -439,60 +439,73 @@ def setup_scram_users_via_kafka_configs(mechanism: str) -> None:
         return
     
     kafka_configs = os.path.join(kafka_dir, 'bin/kafka-configs.sh')
+    kafka_configs_no_ext = os.path.join(kafka_dir, 'bin/kafka-configs')
     run_in_docker = False
     if not os.path.exists(kafka_configs):
-        run_in_docker = True
+        if os.path.exists(kafka_configs_no_ext):
+            kafka_configs = kafka_configs_no_ext
+        else:
+            run_in_docker = True
     
-    scram_mechanism = 'SCRAM-SHA-512' if 'SHA-512' in mechanism else 'SCRAM-SHA-256'
     base_cmd = [kafka_configs]
     if run_in_docker:
         base_cmd = ['docker', 'exec', 'broker', 'kafka-configs']
-    
-    try:
-        # delete existing SCRAM credentials first
-        subprocess.run(
-            base_cmd + [
-             '--bootstrap-server', 'localhost:9092',
-             '--alter',
-             '--entity-type', 'users',
-             '--entity-name', KAFKA_TEST_USER,
-             '--delete-config', 'scram-sha-256,scram-sha-512'],
-            capture_output=True,
-            timeout=15,
-            check=False
-        )
-        time.sleep(1)
-        
-        # adding SCRAM credentials
-        add_config_value = f'{scram_mechanism}=[password={KAFKA_TEST_PASSWORD}]'
-        result = subprocess.run(
-            base_cmd + [
-             '--bootstrap-server', 'localhost:9092',
-             '--alter',
-             '--entity-type', 'users',
-             '--entity-name', KAFKA_TEST_USER,
-             '--add-config', add_config_value],
+
+    def run_kafka_configs(args):
+        return subprocess.run(
+            base_cmd + args,
             capture_output=True,
             text=True,
-            timeout=15,
-            check=False
+            timeout=30,
+            check=False,
         )
-        
-        if result.returncode == 0:
-            log.info(f"SCRAM user configured: {KAFKA_TEST_USER} ({scram_mechanism})")
-        else:
-            raise RuntimeError(f"Failed to create SCRAM user {KAFKA_TEST_USER} with {scram_mechanism}")
+    
+    try:
+        # Idempotently ensure both SCRAM mechanisms exist for the test user.
+        # This avoids cross-test credential drift between SHA-256 and SHA-512 tests.
+        for scram_mechanism in ('SCRAM-SHA-256', 'SCRAM-SHA-512'):
+            add_config_value = f'{scram_mechanism}=[password={KAFKA_TEST_PASSWORD}]'
+            result = run_kafka_configs([
+                '--bootstrap-server', 'localhost:9092',
+                '--alter',
+                '--entity-type', 'users',
+                '--entity-name', KAFKA_TEST_USER,
+                '--add-config', add_config_value,
+            ])
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to create/update SCRAM credentials for {KAFKA_TEST_USER} ({scram_mechanism}): {result.stderr.strip()}"
+                )
+
+        describe = run_kafka_configs([
+            '--bootstrap-server', 'localhost:9092',
+            '--describe',
+            '--entity-type', 'users',
+            '--entity-name', KAFKA_TEST_USER,
+        ])
+        if describe.returncode != 0:
+            raise RuntimeError(f"Failed to verify SCRAM user {KAFKA_TEST_USER}: {describe.stderr.strip()}")
+        if ('SCRAM-SHA-256' not in describe.stdout) or ('SCRAM-SHA-512' not in describe.stdout):
+            raise RuntimeError(
+                f"SCRAM verification missing mechanisms for {KAFKA_TEST_USER}. output: {describe.stdout.strip()}"
+            )
+
+        log.info(f"SCRAM user configured idempotently: {KAFKA_TEST_USER} (SCRAM-SHA-256,SCRAM-SHA-512)")
     except Exception as e:
         log.error(f"Failed to setup SCRAM users via kafka-configs: {e}")
         raise
 
 def _kafka_ca_cert_path():
-    kafka_dir = os.environ.get('KAFKA_DIR')
+    kafka_dir = os.environ.get('KAFKA_CERT_DIR') or os.environ.get('KAFKA_DIR')
     if kafka_dir:
         ca_path = os.path.join(kafka_dir, 'y-ca.crt')
         if os.path.exists(ca_path):
             return ca_path
     return None
+
+
+def _kafka_cert_dir():
+    return os.environ.get('KAFKA_CERT_DIR') or os.environ.get('KAFKA_DIR', '/opt/kafka')
 
 class KafkaReceiver(object):
     """class for receiving and storing messages on a topic from the kafka broker"""
@@ -527,7 +540,7 @@ class KafkaReceiver(object):
             base_config['security_protocol'] = 'SSL'
             if ca_cert:
                 base_config['ssl_cafile'] = ca_cert
-            kafka_dir = os.environ.get('KAFKA_DIR', '/opt/kafka')
+            kafka_dir = _kafka_cert_dir()
             client_cert = os.path.join(kafka_dir, 'config/client.crt')
             client_key = os.path.join(kafka_dir, 'config/client.key')
             if os.path.exists(client_cert) and os.path.exists(client_key):
@@ -4643,18 +4656,18 @@ def kafka_security(security_type, mechanism='PLAIN', use_topic_attrs_for_creds=F
     if security_type == 'SASL_PLAINTEXT':
         endpoint_args = 'push-endpoint='+endpoint_address+'&kafka-ack-level=broker&use-ssl=false&mechanism='+mechanism
     elif security_type == 'SASL_SSL':
-        KAFKA_DIR = os.environ['KAFKA_DIR']
-        endpoint_args = 'push-endpoint='+endpoint_address+'&kafka-ack-level=broker&use-ssl=true&ca-location='+KAFKA_DIR+'/y-ca.crt&mechanism='+mechanism
+        kafka_cert_dir = _kafka_cert_dir()
+        endpoint_args = 'push-endpoint='+endpoint_address+'&kafka-ack-level=broker&use-ssl=true&ca-location='+kafka_cert_dir+'/y-ca.crt&mechanism='+mechanism
         if use_topic_attrs_for_creds:
             endpoint_args += '&user-name=alice&password=alice-secret'
     elif security_type == 'MTLS':
-        KAFKA_DIR = os.environ['KAFKA_DIR']
-        endpoint_args = 'push-endpoint='+endpoint_address+'&kafka-ack-level=broker&use-ssl=true&ca-location='+KAFKA_DIR+'/y-ca.crt'
-        endpoint_args += '&ssl-certificate-location='+KAFKA_DIR+'/client.crt'
-        endpoint_args += '&ssl-key-location='+KAFKA_DIR+'/client.key'
+        kafka_cert_dir = _kafka_cert_dir()
+        endpoint_args = 'push-endpoint='+endpoint_address+'&kafka-ack-level=broker&use-ssl=true&ca-location='+kafka_cert_dir+'/y-ca.crt'
+        endpoint_args += '&ssl-certificate-location='+kafka_cert_dir+'/client.crt'
+        endpoint_args += '&ssl-key-location='+kafka_cert_dir+'/client.key'
     else:
-        KAFKA_DIR = os.environ['KAFKA_DIR']
-        endpoint_args = 'push-endpoint='+endpoint_address+'&kafka-ack-level=broker&use-ssl=true&ca-location='+KAFKA_DIR+'/y-ca.crt'
+        kafka_cert_dir = _kafka_cert_dir()
+        endpoint_args = 'push-endpoint='+endpoint_address+'&kafka-ack-level=broker&use-ssl=true&ca-location='+kafka_cert_dir+'/y-ca.crt'
 
     topic_conf = PSTopicS3(conn, topic_name, zonegroup, endpoint_args=endpoint_args)
 
