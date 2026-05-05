@@ -1,4 +1,10 @@
 *~
+src/test/rgw/bucket_notification/*.crt
+src/test/rgw/bucket_notification/*.key
+src/test/rgw/bucket_notification/*.req
+src/test/rgw/bucket_notification/*.jks
+src/test/rgw/bucket_notification/*.srl
+.venv
 *.co
 *.diff
 *.deb

@@ -422,7 +422,7 @@ META_PREFIX = 'x-amz-meta-'
 
 # Kafka endpoint functions
 
-default_kafka_server = get_ip()
+default_kafka_server = os.environ.get('BN_KAFKA_HOST', get_ip())
 KAFKA_TEST_USER = 'alice'
 KAFKA_TEST_PASSWORD = 'alice-secret'
 
@@ -439,18 +439,20 @@ def setup_scram_users_via_kafka_configs(mechanism: str) -> None:
         return
     
     kafka_configs = os.path.join(kafka_dir, 'bin/kafka-configs.sh')
+    run_in_docker = False
     if not os.path.exists(kafka_configs):
-        log.warning(f"kafka-configs.sh not found at {kafka_configs}")
-        return
+        run_in_docker = True
     
     scram_mechanism = 'SCRAM-SHA-512' if 'SHA-512' in mechanism else 'SCRAM-SHA-256'
-    zk_connect = 'localhost:2181'
+    base_cmd = [kafka_configs]
+    if run_in_docker:
+        base_cmd = ['docker', 'exec', 'broker', 'kafka-configs']
     
     try:
         # delete existing SCRAM credentials first
         subprocess.run(
-            [kafka_configs,
-             '--zookeeper', zk_connect,
+            base_cmd + [
+             '--bootstrap-server', 'localhost:9092',
              '--alter',
              '--entity-type', 'users',
              '--entity-name', KAFKA_TEST_USER,
@@ -464,8 +466,8 @@ def setup_scram_users_via_kafka_configs(mechanism: str) -> None:
         # adding SCRAM credentials
         add_config_value = f'{scram_mechanism}=[password={KAFKA_TEST_PASSWORD}]'
         result = subprocess.run(
-            [kafka_configs,
-             '--zookeeper', zk_connect,
+            base_cmd + [
+             '--bootstrap-server', 'localhost:9092',
              '--alter',
              '--entity-type', 'users',
              '--entity-name', KAFKA_TEST_USER,
@@ -507,7 +509,7 @@ class KafkaReceiver(object):
             port = 9093
             effective_protocol = 'SSL'
         elif security_type == 'SASL_SSL':
-            port = 9094
+            port = 9096
             effective_protocol = 'SASL_SSL'
         elif security_type == 'SASL_PLAINTEXT':
             port = 9095
@@ -4667,9 +4669,9 @@ def kafka_security(security_type, mechanism='PLAIN', use_topic_attrs_for_creds=F
     # create topic
     if security_type == 'SASL_SSL':
         if not use_topic_attrs_for_creds:
-            endpoint_address = 'kafka://alice:alice-secret@' + default_kafka_server + ':9094'
+            endpoint_address = 'kafka://alice:alice-secret@' + default_kafka_server + ':9096'
         else:
-            endpoint_address = 'kafka://' + default_kafka_server + ':9094'
+            endpoint_address = 'kafka://' + default_kafka_server + ':9096'
     elif security_type == 'SSL':
         endpoint_address = 'kafka://' + default_kafka_server + ':9093'
     elif security_type == 'MTLS':
@@ -6144,4 +6146,3 @@ def test_kafka_batch_size():
 def test_kafka_batch_size_mismatch():
     """ test that without rgw_kafka_max_batch_size, batched messages exceed the broker limit """
     kafka_batch_size(match_batch_size=False)
-

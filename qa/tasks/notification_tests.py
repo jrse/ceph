@@ -225,6 +225,25 @@ def run_tests(ctx, config):
         if 'extra_attr' in client_config:
             markers = client_config.get('extra_attr')
 
+        if 'kafka_security_test' in markers:
+            cluster_name, daemon_type, client_id = teuthology.split_role(client)
+            client_with_id = daemon_type + '.' + client_id
+            ctx.cluster.only(client).run(
+                args=[
+                    'adjust-ulimits',
+                    'ceph-coverage',
+                    '{tdir}/archive/coverage'.format(tdir=testdir),
+                    'ceph',
+                    '-n', client_with_id,
+                    '--cluster', cluster_name,
+                    'config', 'set', 'global',
+                    'rgw_allow_notification_secrets_in_cleartext',
+                    'true',
+                    '--force',
+                ],
+                label='enable cleartext secrets for kafka security tests',
+            )
+
         args = [
             'BNTESTS_CONF={tdir}/ceph/src/test/rgw/bucket_notification/bn-tests.{client}.conf'.format(tdir=testdir, client=client),
             ]

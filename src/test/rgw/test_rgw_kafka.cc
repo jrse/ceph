@@ -3,27 +3,23 @@
 
 #include "rgw_kafka.h"
 #include "common/ceph_context.h"
+#include "common/ceph_argparse.h"
+#include "global/global_init.h"
 #include "kafka_mock.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 
 using namespace rgw;
 
-class CctCleaner {
-  CephContext* cct;
-public:
-  CctCleaner(CephContext* _cct) : cct(_cct) {}
-  ~CctCleaner() {
-#ifdef WITH_CRIMSON
-    delete cct;
-#else
-    cct->put();
-#endif
-  }
-};
-
-auto cct = new CephContext(CEPH_ENTITY_TYPE_CLIENT);
-CctCleaner cleaner(cct);
+auto cct_holder = [] {
+  std::vector<const char*> args;
+  auto cct = global_init(nullptr, args, CEPH_ENTITY_TYPE_CLIENT,
+                         CODE_ENVIRONMENT_UTILITY,
+                         CINIT_FLAG_NO_DEFAULT_CONFIG_FILE);
+  common_init_finish(cct.get());
+  return cct;
+}();
+auto cct = cct_holder.get();
 
 class TestKafka : public ::testing::Test {
 protected:
@@ -31,6 +27,7 @@ protected:
 
   void SetUp() override {
     kafka_mock::reset();
+    cct->_conf.set_val_or_die("rgw_allow_notification_secrets_in_cleartext", "true");
     ASSERT_TRUE(kafka::init(cct));
   }
 
@@ -99,8 +96,9 @@ TEST_F(TestKafka, ConnectionReuse)
 
 TEST_F(TestKafka, SSLConnection)
 {
+  const std::string ca = "/path/to/ca.crt";
   auto rc = kafka::connect(conn_id, "kafka://localhost:9093",
-    true, true, std::string("/path/to/ca.crt"), boost::none,
+    true, true, ca, boost::none,
     boost::none, boost::none, boost::none,
     boost::none, boost::none, boost::none);
   EXPECT_TRUE(rc);
@@ -114,11 +112,14 @@ TEST_F(TestKafka, SSLConnection)
 
 TEST_F(TestKafka, MTLSConnection)
 {
+  const std::string ca = "/path/to/ca.crt";
+  const std::string cert = "/path/to/client.crt";
+  const std::string key = "/path/to/client.key";
   auto rc = kafka::connect(conn_id, "kafka://localhost:9093",
-    true, true, std::string("/path/to/ca.crt"), boost::none,
+    true, true, ca, boost::none,
     boost::none, boost::none, boost::none,
-    std::string("/path/to/client.crt"),
-    std::string("/path/to/client.key"),
+    cert,
+    key,
     boost::none);
   EXPECT_TRUE(rc);
   EXPECT_TRUE(has_conf("security.protocol", "SSL"));
@@ -130,12 +131,16 @@ TEST_F(TestKafka, MTLSConnection)
 
 TEST_F(TestKafka, MTLSConnectionWithKeyPassword)
 {
+  const std::string ca = "/path/to/ca.crt";
+  const std::string cert = "/path/to/client.crt";
+  const std::string key = "/path/to/client.key";
+  const std::string key_password = "my-key-password";
   auto rc = kafka::connect(conn_id, "kafka://localhost:9093",
-    true, true, std::string("/path/to/ca.crt"), boost::none,
+    true, true, ca, boost::none,
     boost::none, boost::none, boost::none,
-    std::string("/path/to/client.crt"),
-    std::string("/path/to/client.key"),
-    std::string("my-key-password"));
+    cert,
+    key,
+    key_password);
   EXPECT_TRUE(rc);
   EXPECT_TRUE(has_conf("security.protocol", "SSL"));
   EXPECT_TRUE(has_conf("ssl.ca.location", "/path/to/ca.crt"));
@@ -146,21 +151,26 @@ TEST_F(TestKafka, MTLSConnectionWithKeyPassword)
 
 TEST_F(TestKafka, MTLSConnectionDifferentCertsAreDifferentConnections)
 {
+  const std::string ca = "/path/to/ca.crt";
+  const std::string cert1 = "/path/to/client1.crt";
+  const std::string key1 = "/path/to/client1.key";
   auto rc = kafka::connect(conn_id, "kafka://localhost:9093",
-    true, true, std::string("/path/to/ca.crt"), boost::none,
+    true, true, ca, boost::none,
     boost::none, boost::none, boost::none,
-    std::string("/path/to/client1.crt"),
-    std::string("/path/to/client1.key"),
+    cert1,
+    key1,
     boost::none);
   EXPECT_TRUE(rc);
   const auto count = kafka::get_connection_count();
 
+  const std::string cert2 = "/path/to/client2.crt";
+  const std::string key2 = "/path/to/client2.key";
   kafka::connection_id_t conn_id2;
   rc = kafka::connect(conn_id2, "kafka://localhost:9093",
-    true, true, std::string("/path/to/ca.crt"), boost::none,
+    true, true, ca, boost::none,
     boost::none, boost::none, boost::none,
-    std::string("/path/to/client2.crt"),
-    std::string("/path/to/client2.key"),
+    cert2,
+    key2,
     boost::none);
   EXPECT_TRUE(rc);
   // different client certs should create a different connection
@@ -169,21 +179,24 @@ TEST_F(TestKafka, MTLSConnectionDifferentCertsAreDifferentConnections)
 
 TEST_F(TestKafka, MTLSSameCertsReuseConnection)
 {
+  const std::string ca = "/path/to/ca.crt";
+  const std::string cert = "/path/to/client.crt";
+  const std::string key = "/path/to/client.key";
   auto rc = kafka::connect(conn_id, "kafka://localhost:9093",
-    true, true, std::string("/path/to/ca.crt"), boost::none,
+    true, true, ca, boost::none,
     boost::none, boost::none, boost::none,
-    std::string("/path/to/client.crt"),
-    std::string("/path/to/client.key"),
+    cert,
+    key,
     boost::none);
   EXPECT_TRUE(rc);
   const auto count = kafka::get_connection_count();
 
   kafka::connection_id_t conn_id2;
   rc = kafka::connect(conn_id2, "kafka://localhost:9093",
-    true, true, std::string("/path/to/ca.crt"), boost::none,
+    true, true, ca, boost::none,
     boost::none, boost::none, boost::none,
-    std::string("/path/to/client.crt"),
-    std::string("/path/to/client.key"),
+    cert,
+    key,
     boost::none);
   EXPECT_TRUE(rc);
   // same certs should reuse the connection
@@ -196,9 +209,12 @@ TEST_F(TestKafka, MTLSSameCertsReuseConnection)
 
 TEST_F(TestKafka, SASLPlaintextConnection)
 {
+  const std::string mechanism = "SCRAM-SHA-512";
+  const std::string user = "alice";
+  const std::string password = "alice-secret";
   auto rc = kafka::connect(conn_id, "kafka://localhost:9095",
-    false, false, boost::none, std::string("SCRAM-SHA-512"),
-    std::string("alice"), std::string("alice-secret"),
+    false, false, boost::none, mechanism,
+    user, password,
     boost::none, boost::none, boost::none, boost::none);
   EXPECT_TRUE(rc);
   EXPECT_TRUE(has_conf("security.protocol", "SASL_PLAINTEXT"));
@@ -209,9 +225,13 @@ TEST_F(TestKafka, SASLPlaintextConnection)
 
 TEST_F(TestKafka, SASLSSLConnection)
 {
+  const std::string ca = "/path/to/ca.crt";
+  const std::string mechanism = "SCRAM-SHA-512";
+  const std::string user = "alice";
+  const std::string password = "alice-secret";
   auto rc = kafka::connect(conn_id, "kafka://localhost:9096",
-    true, true, std::string("/path/to/ca.crt"), std::string("SCRAM-SHA-512"),
-    std::string("alice"), std::string("alice-secret"),
+    true, true, ca, mechanism,
+    user, password,
     boost::none, boost::none, boost::none, boost::none);
   EXPECT_TRUE(rc);
   EXPECT_TRUE(has_conf("security.protocol", "SASL_SSL"));
@@ -223,12 +243,18 @@ TEST_F(TestKafka, SASLSSLConnection)
 
 TEST_F(TestKafka, SASLSSLWithMTLS)
 {
+  const std::string ca = "/path/to/ca.crt";
+  const std::string mechanism = "SCRAM-SHA-512";
+  const std::string user = "alice";
+  const std::string password = "alice-secret";
+  const std::string cert = "/path/to/client.crt";
+  const std::string key = "/path/to/client.key";
   auto rc = kafka::connect(conn_id, "kafka://localhost:9096",
-    true, true, std::string("/path/to/ca.crt"), std::string("SCRAM-SHA-512"),
-    std::string("alice"), std::string("alice-secret"),
+    true, true, ca, mechanism,
+    user, password,
     boost::none,
-    std::string("/path/to/client.crt"),
-    std::string("/path/to/client.key"),
+    cert,
+    key,
     boost::none);
   EXPECT_TRUE(rc);
   EXPECT_TRUE(has_conf("security.protocol", "SASL_SSL"));
@@ -252,9 +278,10 @@ TEST_F(TestKafka, SSLvsPlaintextAreDifferentConnections)
   EXPECT_TRUE(rc);
   const auto count = kafka::get_connection_count();
 
+  const std::string ca = "/path/to/ca.crt";
   kafka::connection_id_t conn_id2;
   rc = kafka::connect(conn_id2, "kafka://localhost:9092",
-    true, true, std::string("/path/to/ca.crt"), boost::none,
+    true, true, ca, boost::none,
     boost::none, boost::none, boost::none,
     boost::none, boost::none, boost::none);
   EXPECT_TRUE(rc);
@@ -263,21 +290,24 @@ TEST_F(TestKafka, SSLvsPlaintextAreDifferentConnections)
 
 TEST_F(TestKafka, MTLSvsSSLOnlyAreDifferentConnections)
 {
+  const std::string ca = "/path/to/ca.crt";
   // SSL only (no client cert)
   auto rc = kafka::connect(conn_id, "kafka://localhost:9093",
-    true, true, std::string("/path/to/ca.crt"), boost::none,
+    true, true, ca, boost::none,
     boost::none, boost::none, boost::none,
     boost::none, boost::none, boost::none);
   EXPECT_TRUE(rc);
   const auto count = kafka::get_connection_count();
 
   // SSL + mTLS (with client cert)
+  const std::string cert = "/path/to/client.crt";
+  const std::string key = "/path/to/client.key";
   kafka::connection_id_t conn_id2;
   rc = kafka::connect(conn_id2, "kafka://localhost:9093",
-    true, true, std::string("/path/to/ca.crt"), boost::none,
+    true, true, ca, boost::none,
     boost::none, boost::none, boost::none,
-    std::string("/path/to/client.crt"),
-    std::string("/path/to/client.key"),
+    cert,
+    key,
     boost::none);
   EXPECT_TRUE(rc);
   EXPECT_EQ(kafka::get_connection_count(), count + 1);

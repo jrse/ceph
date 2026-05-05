@@ -12,6 +12,13 @@ from teuthology.orchestra import run
 
 log = logging.getLogger(__name__)
 
+KAFKA_PORTS = {
+    'PLAINTEXT': 9092,
+    'SSL': 9093,
+    'SASL_SSL': 9096,
+    'SASL_PLAINTEXT': 9095,
+}
+
 def get_kafka_version(config):
     for client, client_config in config.items():
         if 'kafka_version' in client_config:
@@ -116,8 +123,8 @@ def broker_conf(ctx, client, kafka_dir):
     ip = remote.ip_address
     conf = (
         "broker.id=0\n"
-        "listeners=PLAINTEXT://0.0.0.0:9092,SSL://0.0.0.0:9093,SASL_SSL://0.0.0.0:9094,SASL_PLAINTEXT://0.0.0.0:9095\n"
-        "advertised.listeners=PLAINTEXT://{ip}:9092,SSL://{ip}:9093,SASL_SSL://{ip}:9094,SASL_PLAINTEXT://{ip}:9095\n"
+        "listeners=PLAINTEXT://0.0.0.0:{plaintext},SSL://0.0.0.0:{ssl},SASL_SSL://0.0.0.0:{sasl_ssl},SASL_PLAINTEXT://0.0.0.0:{sasl_plaintext}\n"
+        "advertised.listeners=PLAINTEXT://{ip}:{plaintext},SSL://{ip}:{ssl},SASL_SSL://{ip}:{sasl_ssl},SASL_PLAINTEXT://{ip}:{sasl_plaintext}\n"
         "listener.security.protocol.map=PLAINTEXT:PLAINTEXT,SSL:SSL,SASL_SSL:SASL_SSL,SASL_PLAINTEXT:SASL_PLAINTEXT\n"
         "log.dirs={tdir}/data/kafka-logs\n"
         "num.network.threads=3\n"
@@ -164,7 +171,14 @@ def broker_conf(ctx, client, kafka_dir):
         'listener.name.sasl_plaintext.scram-sha-512.sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required \\\n'
         '  username="admin" \\\n'
         '  password="admin-secret";\n'
-    ).format(tdir=kafka_dir, ip=ip)
+    ).format(
+        tdir=kafka_dir,
+        ip=ip,
+        plaintext=KAFKA_PORTS['PLAINTEXT'],
+        ssl=KAFKA_PORTS['SSL'],
+        sasl_ssl=KAFKA_PORTS['SASL_SSL'],
+        sasl_plaintext=KAFKA_PORTS['SASL_PLAINTEXT'],
+    )
     file_name = 'server.properties'
     log.info("kafka conf file: %s", file_name)
     log.info(conf)
@@ -281,6 +295,31 @@ def run_admin_cmds(ctx,config):
         pass
 
 
+def configure_scram_users(ctx, config):
+    """Create SCRAM users for both supported mechanisms."""
+    log.info('Configuring Kafka SCRAM users...')
+    for (client, _) in config.items():
+        (remote,) = ctx.cluster.only(client).remotes.keys()
+        bootstrap = '{ip}:{port}'.format(
+            ip=remote.ip_address,
+            port=KAFKA_PORTS['PLAINTEXT'],
+        )
+        kafka_bin = '{tdir}/bin'.format(tdir=get_kafka_dir(ctx, config))
+        for user, secret in (('alice', 'alice-secret'), ('admin', 'admin-secret')):
+            for mechanism in ('SCRAM-SHA-256', 'SCRAM-SHA-512'):
+                ctx.cluster.only(client).run(
+                    args=[
+                        'cd', kafka_bin, run.Raw('&&'),
+                        './kafka-configs.sh',
+                        '--bootstrap-server', bootstrap,
+                        '--alter',
+                        '--add-config', '{mech}=[password={pw}]'.format(mech=mechanism, pw=secret),
+                        '--entity-type', 'users',
+                        '--entity-name', user,
+                    ],
+                )
+
+
 @contextlib.contextmanager
 def task(ctx,config):
     """
@@ -310,4 +349,5 @@ def task(ctx,config):
         lambda: run_kafka(ctx=ctx, config=config),
         lambda: run_admin_cmds(ctx=ctx, config=config),
         ):
+        configure_scram_users(ctx, config)
         yield
