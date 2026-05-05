@@ -5,6 +5,7 @@ import string
 from typing import List, Dict, Any, Tuple, cast, Optional, TYPE_CHECKING
 
 from ceph.deployment.service_spec import ServiceSpec, IngressSpec, MonitorCertSource
+from ceph.deployment.utils import is_ipv6
 from mgr_util import build_url
 from cephadm import utils
 from orchestrator import OrchestratorError, DaemonDescription
@@ -121,7 +122,7 @@ class IngressService(CephService):
             ssl_cert_key = getattr(ingress_spec, attr, None)
             if ssl_cert_key:
                 assert isinstance(ssl_cert_key, str)
-                deps.append(f'ssl-cert-key:{str(utils.md5_hash(ssl_cert_key))}')
+                deps.append(f'ssl-cert-key:{utils.config_hash(ssl_cert_key)}')
         backend_spec = mgr.spec_store[ingress_spec.backend_service].spec
         if backend_spec.service_type == 'nfs':
             hosts = get_placement_hosts(spec, mgr.cache.get_schedulable_hosts(), mgr.cache.get_draining_hosts())
@@ -275,6 +276,7 @@ class IngressService(CephService):
                 'v4v6_flag': v4v6_flag,
                 'monitor_ssl_file': monitor_ssl_file,
                 'peer_hosts': peer_hosts,
+                'is_ipv6': is_ipv6(ip)
             }
         )
         config_files = {

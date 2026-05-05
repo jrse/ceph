@@ -1350,8 +1350,13 @@ yaml.add_representer(ServiceSpec, ServiceSpec.yaml_representer)
 
 
 class NFSServiceSpec(ServiceSpec):
-    COLOCATION_PORT_FIELDS = ['data_port', 'monitoring_port']
-    COLOCATION_PORT_FIELDS_WITH_RDMA = ['data_port', 'monitoring_port', 'rdma_port']
+    COLOCATION_PORT_FIELDS = ['data_port', 'monitoring_port', 'cluster_qos_port']
+    COLOCATION_PORT_FIELDS_WITH_RDMA = [
+        'data_port',
+        'monitoring_port',
+        'cluster_qos_port',
+        'rdma_port'
+    ]
 
     def __init__(self,
                  service_type: str = 'nfs',
@@ -1375,6 +1380,8 @@ class NFSServiceSpec(ServiceSpec):
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
                  idmap_conf: Optional[Dict[str, Dict[str, str]]] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
+                 cluster_qos_config: Optional[Dict[str, Union[str, bool, int]]] = None,
+                 cluster_qos_port: Optional[int] = None,
                  ssl: bool = False,
                  ssl_cert: Optional[str] = None,
                  ssl_key: Optional[str] = None,
@@ -1412,6 +1419,8 @@ class NFSServiceSpec(ServiceSpec):
         self.enable_nlm = enable_nlm
         self.enable_rdma = enable_rdma
         self.rdma_port = rdma_port
+        self.cluster_qos_config = cluster_qos_config
+        self.cluster_qos_port = cluster_qos_port
 
         # colocation_ports is a list of port dicts for ADDITIONAL colocated daemons
         # The first daemon always uses port and monitoring_port from the spec
@@ -1431,7 +1440,7 @@ class NFSServiceSpec(ServiceSpec):
         return self.COLOCATION_PORT_FIELDS
 
     def get_port_start(self) -> List[int]:
-        ports = [self.port or 2049, self.monitoring_port or 9587]
+        ports = [self.port or 2049, self.monitoring_port or 9587, self.cluster_qos_port or 31311]
         if self.enable_rdma:
             ports.append(self.rdma_port or 20049)
         return ports
@@ -1500,6 +1509,43 @@ class NFSServiceSpec(ServiceSpec):
 
         # Validate colocation_ports
         self.validate_colocation_ports()
+
+        # validate qos dict
+        if self.cluster_qos_config:
+            qos_enable = self.cluster_qos_config.get('enable_qos', True)
+            enable_bw_ctrl = self.cluster_qos_config.get('enable_bw_control', False)
+            combined_bw_ctrl = self.cluster_qos_config.get('combined_rw_bw_control', False)
+            enable_ops_ctrl = self.cluster_qos_config.get('enable_iops_control', False)
+            for key in [qos_enable, enable_bw_ctrl, combined_bw_ctrl, enable_ops_ctrl]:
+                if not isinstance(key, bool):
+                    raise SpecValidationError('Invalid NFS spec: cluster_qos_config is not correct')
+            if not qos_enable or not (enable_bw_ctrl or enable_ops_ctrl):
+                # this means bandwidth or iops qos won't be enable, we don't need to set qos
+                self.cluster_qos_config = None
+                return
+
+            # Verify qos_type
+            qos_type = self.cluster_qos_config.get('qos_type')
+            valid_qos_types = ['PerShare', 'PerClient', 'PerShare_PerClient']
+            if not qos_type:
+                raise SpecValidationError(
+                    'Invalid NFS spec: to set cluster-level QoS, "qos_type" must be provided.'
+                )
+            if qos_type not in valid_qos_types:
+                raise SpecValidationError(
+                    f'Invalid NFS spec: "{qos_type}" is not a valid qos_type. '
+                    f'Valid types are: {"|".join(valid_qos_types)}.'
+                )
+
+            # Verify bandwidth and IOPS types
+            for key, value in self.cluster_qos_config.items():
+                if key.endswith('bw') and not isinstance(value, str):
+                    raise SpecValidationError(
+                        f"Invalid NFS spec: bandwidth '{key}' should be a string"
+                    )
+                if key.endswith('iops') and not isinstance(value, int):
+                    raise SpecValidationError(
+                        f"Invalid NFS spec: IOPS '{key}' should be an integer")
 
         # TLS certificate validation
         if self.ssl and not self.certificate_source:
@@ -2658,13 +2704,16 @@ class OAuth2ProxySpec(ServiceSpec):
                  client_secret: Optional[str] = None,
                  oidc_issuer_url: Optional[str] = None,
                  redirect_url: Optional[str] = None,
+                 scope: Optional[str] = None,
                  cookie_secret: Optional[str] = None,
                  ssl_cert: Optional[str] = None,
                  ssl_key: Optional[str] = None,
                  ssl: Optional[bool] = True,
                  certificate_source: Optional[str] = None,
                  custom_sans: Optional[List[str]] = None,
+                 email_domains: Optional[List[str]] = None,
                  allowlist_domains: Optional[List[str]] = None,
+                 ssl_insecure_skip_verify: Optional[bool] = False,
                  unmanaged: bool = False,
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
@@ -2698,12 +2747,19 @@ class OAuth2ProxySpec(ServiceSpec):
         #: The URL oauth2-proxy will redirect to after a successful login. If not provided
         # cephadm will calculate automatically the value of this url.
         self.redirect_url = redirect_url
+        #: OAuth scope specification.
+        # Default list of scopes will be used in case no scope is configured.
+        self.scope = scope
         #: The secret key used for signing cookies. Its length must be 16,
         # 24, or 32 bytes to create an AES cipher.
         self.cookie_secret = cookie_secret or self.generate_random_secret()
+        #: List of allowed email domains.
+        self.email_domains = email_domains
         #: List of allowed domains for safe redirection after login or logout,
         # preventing unauthorized redirects.
         self.allowlist_domains = allowlist_domains
+        #: Skip TLS verification for the OIDC provider. Use only in non-production environments.
+        self.ssl_insecure_skip_verify = ssl_insecure_skip_verify
         self.unmanaged = unmanaged
 
     def generate_random_secret(self) -> str:
@@ -2725,6 +2781,10 @@ class OAuth2ProxySpec(ServiceSpec):
         self._validate_url(self.oidc_issuer_url, "oidc_issuer_url")
         if self.redirect_url is not None:
             self._validate_url(self.redirect_url, "redirect_url")
+        if self.scope is not None:
+            self._validate_non_empty_string(self.scope, "scope")
+        if self.email_domains is not None:
+            self._validate_domain_name(self.email_domains, "email_domains")
         if self.https_address is not None:
             self._validate_https_address(self.https_address)
 
@@ -2741,6 +2801,22 @@ class OAuth2ProxySpec(ServiceSpec):
         else:
             if not all([result.scheme, result.netloc]):
                 raise SpecValidationError(f"Error parsing {field_name} field: Must be a valid URL.")
+
+    def _validate_domain_name(self, domains: Optional[List[str]], field_name: str) -> None:
+        from urllib.parse import urlparse
+        for domain in (domains or []):
+            try:
+                result = urlparse(f"http://{domain}")
+            except Exception as e:
+                raise SpecValidationError(
+                    f"Invalid {field_name}: {e}. Must be a valid domain name."
+                )
+            else:
+                if result.netloc != domain:
+                    raise SpecValidationError(
+                        f"Invalid {field_name}: '{domain}' is not a valid domain name. "
+                        f"Must be a valid domain (e.g., 'domain.test')."
+                    )
 
     def _validate_https_address(self, https_address: Optional[str]) -> None:
         from urllib.parse import urlparse

@@ -31,6 +31,7 @@ struct connection_id_t {
   std::string ssl_certificate;
   std::string ssl_key;
   bool ssl = false;
+  bool verify_ssl = true;
   connection_id_t() = default;
   connection_id_t(const std::string& _broker,
                   const std::string& _user,
@@ -39,7 +40,8 @@ struct connection_id_t {
                   const boost::optional<const std::string&>& _mechanism,
                   bool _ssl,
                   const boost::optional<const std::string&>& _ssl_certificate,
-                  const boost::optional<const std::string&>& _ssl_key);
+                  const boost::optional<const std::string&>& _ssl_key,
+                  bool _verify_ssl);
 };
 
 std::string to_string(const connection_id_t& id);

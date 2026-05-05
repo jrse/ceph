@@ -920,6 +920,46 @@ def test_topic():
     list_topics(0, tenant)
 
 
+@pytest.mark.manual_test
+def test_topic_name():
+    """ test topic name validation """
+    conn = connection()
+    # make sure there are no leftover topics
+    delete_all_topics(conn, '', get_config_cluster())
+
+    zonegroup = get_config_zonegroup()
+    bucket_name = gen_bucket_name()
+    invalid_topic_name = bucket_name + '+' + TOPIC_SUFFIX
+    rgw_client = f'client.rgw.{get_config_port()}'
+
+    # fail to create topic
+    endpoint_address = 'http://127.0.0.1:7001/'
+    endpoint_args = 'push-endpoint='+endpoint_address+'&persistent=true'
+    topic_conf = PSTopicS3(conn, invalid_topic_name, zonegroup, endpoint_args=endpoint_args)
+    pytest.raises(Exception, topic_conf.set_config)
+
+    # relax topic name validation
+    set_rgw_config_option(rgw_client, 'rgw_relaxed_topic_names', 'true', get_config_cluster())
+    # create topic
+    expected_arn = 'arn:aws:sns:' + zonegroup + '::' + invalid_topic_name
+    topic_arn = topic_conf.set_config()
+    assert topic_arn == expected_arn
+
+    set_rgw_config_option(rgw_client, 'rgw_relaxed_topic_names', 'false', get_config_cluster())
+
+    # get topic (should be possible regardless of the relaxed topic name setting)
+    parsed_result = get_topic(invalid_topic_name)
+    assert parsed_result['arn'] == expected_arn
+
+    # delete topic
+    status = topic_conf.del_config()
+    assert status == 200
+
+    # maks sure that empty topic names are invalid regardless of flag
+    empty_topic_conf = PSTopicS3(conn, "", zonegroup, endpoint_args=endpoint_args)
+    pytest.raises(Exception, empty_topic_conf.set_config)
+
+
 @pytest.mark.basic_test
 def test_topic_admin():
     """ test topics set/get/delete """
@@ -4624,7 +4664,8 @@ def test_topic_no_permissions():
     conn2.delete_bucket(bucket_name)
 
 
-def kafka_security(security_type, mechanism='PLAIN', use_topic_attrs_for_creds=False):
+def kafka_security(security_type, mechanism='PLAIN', use_topic_attrs_for_creds=False,
+                   verify_ssl=True, include_ca_location=True):
     """ test pushing kafka notification securly to master """
     # Setup SCRAM users if needed
     if mechanism.startswith('SCRAM'):
@@ -4733,6 +4774,11 @@ def kafka_security(security_type, mechanism='PLAIN', use_topic_attrs_for_creds=F
 @pytest.mark.kafka_security_test
 def test_notification_kafka_security_ssl():
     kafka_security('SSL')
+
+
+@pytest.mark.kafka_security_test
+def test_notification_kafka_security_ssl_skip_verification_without_ca():
+    kafka_security('SSL', verify_ssl=False, include_ca_location=False)
 
 
 @pytest.mark.kafka_security_test

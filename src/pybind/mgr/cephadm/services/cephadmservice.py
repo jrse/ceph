@@ -891,6 +891,9 @@ class CephadmService(metaclass=ABCMeta):
     def get_blocking_daemon_hosts(self, service_name: str) -> List[HostSpec]:
         return []
 
+    def pre_daemon_service_config(self, spec: ServiceSpec) -> None:
+        return
+
     def has_placement_changed(self, deps: List[str], spec: ServiceSpec) -> bool:
         return False
 
@@ -1343,7 +1346,7 @@ class RgwService(CephService):
         if ssl_cert:
             if isinstance(ssl_cert, list):
                 ssl_cert = '\n'.join(ssl_cert)
-            deps.append(f'ssl-cert:{str(utils.md5_hash(ssl_cert))}')
+            deps.append(f'ssl-cert:{utils.config_hash(ssl_cert)}')
 
         return sorted(deps)
 

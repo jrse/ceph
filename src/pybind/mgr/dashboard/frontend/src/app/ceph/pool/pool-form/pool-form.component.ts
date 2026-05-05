@@ -4,6 +4,7 @@ import { ActivatedRoute, Router } from '@angular/router';
 
 import { NgbNav } from '@ng-bootstrap/ng-bootstrap';
 import _ from 'lodash';
+import { startWith } from 'rxjs/operators';
 import { Observable, ReplaySubject, Subscription } from 'rxjs';
 
 import { DashboardNotFoundError } from '~/app/core/error/error';
@@ -26,7 +27,6 @@ import { CrushRule } from '~/app/shared/models/crush-rule';
 import { CrushStep } from '~/app/shared/models/crush-step';
 import { ErasureCodeProfile } from '~/app/shared/models/erasure-code-profile';
 import { FinishedTask } from '~/app/shared/models/finished-task';
-import { Permission } from '~/app/shared/models/permissions';
 import { PoolFormInfo } from '~/app/shared/models/pool-form-info';
 import { DimlessBinaryPipe } from '~/app/shared/pipes/dimless-binary.pipe';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
@@ -40,6 +40,7 @@ import { PoolEditModeResponseModel } from '../../block/mirroring/pool-edit-mode-
 import { RbdMirroringService } from '~/app/shared/api/rbd-mirroring.service';
 import { MonitorService } from '~/app/shared/api/monitor.service';
 import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
+import { Permissions } from '~/app/shared/models/permissions';
 
 interface FormFieldDescription {
   externalFieldName: string;
@@ -72,7 +73,7 @@ export class PoolFormComponent extends CdForm implements OnInit {
 
   isFormSubmitted = false;
 
-  permission: Permission;
+  permissions: Permissions;
   form: CdFormGroup;
   ecProfiles: ErasureCodeProfile[];
   selectedEcp: ErasureCodeProfile;
@@ -138,11 +139,11 @@ export class PoolFormComponent extends CdForm implements OnInit {
   }
 
   authenticate() {
-    this.permission = this.authStorageService.getPermissions().pool;
+    this.permissions = this.authStorageService.getPermissions();
     if (
-      !this.permission.read ||
-      (!this.permission.update && this.editing) ||
-      (!this.permission.create && !this.editing)
+      !this.permissions?.pool?.read ||
+      (!this.permissions?.pool?.update && this.editing) ||
+      (!this.permissions?.pool?.create && !this.editing)
     ) {
       throw new DashboardNotFoundError();
     }
@@ -221,13 +222,15 @@ export class PoolFormComponent extends CdForm implements OnInit {
   }
 
   ngOnInit() {
-    this.monitorService.getMonitor().subscribe((data: MonitorResponse) => {
-      this.isStretchMode = data?.mon_status?.stretch_mode || false;
-      if (this.isStretchMode) {
-        this.applyStretchModeRestrictions();
-      }
-      this.replicatedRuleChange();
-    });
+    if (this.permissions?.monitor?.read) {
+      this.monitorService.getMonitor().subscribe((data: MonitorResponse) => {
+        this.isStretchMode = data?.mon_status?.stretch_mode || false;
+        if (this.isStretchMode) {
+          this.applyStretchModeRestrictions();
+        }
+        this.replicatedRuleChange();
+      });
+    }
     this.poolService.getInfo().subscribe((info: PoolFormInfo) => {
       this.initInfo(info);
       if (this.editing) {
@@ -459,16 +462,14 @@ export class PoolFormComponent extends CdForm implements OnInit {
       this.pgCalc();
     });
 
-    this.form.get('erasureProfile').valueChanges.subscribe((profile) => {
-      // The ec profile can only be changed if type 'erasure' is set.
-      if (!profile) {
-        return;
-      }
-      this.data.erasureInfo = false;
-      this.erasureProfileChange();
-      this.ecpIsUsedBy(profile);
-      this.pgCalc();
-    });
+    this.form
+      .get('erasureProfile')
+      .valueChanges.pipe(startWith(this.form.getValue('erasureProfile')))
+      .subscribe((profile) => {
+        // The ec profile can only be changed if type 'erasure' is set.
+        this.erasureProfileChange(profile);
+        this.pgCalc();
+      });
     this.form.get('mode').valueChanges.subscribe(() => {
       ['minBlobSize', 'maxBlobSize', 'ratio'].forEach((name) => {
         this.form.get(name).updateValueAndValidity({ emitEvent: false });
@@ -1093,16 +1094,27 @@ export class PoolFormComponent extends CdForm implements OnInit {
     this.form.get('name').updateValueAndValidity({ emitEvent: false, onlySelf: true });
   }
 
-  erasureProfileChange() {
+  erasureProfileChange(selectedName?: string) {
     if (!this.ecProfiles || this.ecProfiles.length === 0) {
       return;
     }
-    const selectedName = this.form.get('erasureProfile').value;
-    this.selectedEcp = this.ecProfiles.find((ecp: ErasureCodeProfile) => ecp.name === selectedName);
-    if (this.selectedEcp) {
+    const formSelectedName = this.form.get('erasureProfile')?.value;
+    const resolvedName = selectedName ?? formSelectedName ?? this.ecProfiles[0]?.name;
+    const selectedEcp = this.ecProfiles.find(
+      (ecp: ErasureCodeProfile) => ecp.name === resolvedName
+    );
+    this.ecpIsUsedBy(resolvedName);
+    if (resolvedName) {
+      this.data.erasureInfo = false;
+    }
+    if (selectedEcp) {
+      this.selectedEcp = selectedEcp;
       this.msrCrush =
-        this.selectedEcp['crush-num-failure-domains'] > 0 ||
-        this.selectedEcp['crush-osds-per-failure-domain'] > 0;
+        (selectedEcp['crush-num-failure-domains'] ?? 0) > 0 ||
+        (selectedEcp['crush-osds-per-failure-domain'] ?? 0) > 0;
+    } else {
+      this.selectedEcp = undefined as any;
+      this.msrCrush = false;
     }
   }
 }

@@ -1228,10 +1228,18 @@ def clean_cgroup(ctx: CephadmContext, fsid: str, unit_name: str) -> None:
             if p.is_dir():
                 cg_trim(p)
         path.rmdir()
-    try:
-        cg_trim(cg_path)
-    except OSError:
-        logger.warning(f'Failed to trim old cgroups {cg_path}')
+
+    for s in [0.5, 1.0, 2.0, False]:
+        try:
+            cg_trim(cg_path)
+        except OSError:
+            if not s:
+                logger.warning(f'Failed 4 times to trim old cgroups <{cg_path}>. Giving up!')
+            else:
+                logger.warning(f'Failed to trim old cgroups <{cg_path}>. Retrying in {s} seconds...')
+                time.sleep(s)
+        else:
+            break
 
 
 def deploy_daemon_units(
@@ -2044,7 +2052,7 @@ def _pull_image(ctx, image, insecure=False):
 @infer_image
 def command_inspect_image(ctx):
     # type: (CephadmContext) -> int
-    out, err, ret = call_throws(ctx, [
+    out, err, ret = call(ctx, [
         ctx.container_engine.path, 'inspect',
         '--format', '{{.ID}},{{.RepoDigests}}',
         ctx.image])
