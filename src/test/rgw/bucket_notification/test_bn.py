@@ -440,16 +440,16 @@ def setup_scram_users_via_kafka_configs(mechanism: str) -> None:
     
     kafka_configs = os.path.join(kafka_dir, 'bin/kafka-configs.sh')
     kafka_configs_no_ext = os.path.join(kafka_dir, 'bin/kafka-configs')
-    run_in_docker = False
     if not os.path.exists(kafka_configs):
         if os.path.exists(kafka_configs_no_ext):
             kafka_configs = kafka_configs_no_ext
         else:
-            run_in_docker = True
-    
+            raise RuntimeError(
+                f"kafka-configs not found under KAFKA_DIR={kafka_dir}. "
+                "Expected bin/kafka-configs.sh or bin/kafka-configs"
+            )
+
     base_cmd = [kafka_configs]
-    if run_in_docker:
-        base_cmd = ['docker', 'exec', 'broker', 'kafka-configs']
 
     def run_kafka_configs(args):
         return subprocess.run(
