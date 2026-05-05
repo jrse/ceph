@@ -4,6 +4,7 @@ src/test/rgw/bucket_notification/*.key
 src/test/rgw/bucket_notification/*.req
 src/test/rgw/bucket_notification/*.jks
 src/test/rgw/bucket_notification/*.srl
+.kafka-local
 .venv
 *.co
 *.diff
