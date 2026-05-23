@@ -1,14 +1,15 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
-#include <errno.h>
+#include <cerrno>
 #include <optional>
-#include <stdlib.h>
+#include <cstdlib>
 #include <system_error>
-#include <unistd.h>
-
+#include <span>
 #include <sstream>
 #include <string_view>
+
+#include <unistd.h>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/optional.hpp>
@@ -1294,7 +1295,7 @@ int RGWGetObj::verify_permission(optional_yield y)
 
   if (is_replication_request) {
     // check for s3:GetObject(Version)Acl permission
-    action = s->object->get_instance().empty() ? rgw::IAM::s3GetObjectAcl : rgw::IAM::s3GetObjectVersionAcl;
+    action = s->object_key.instance.empty() ? rgw::IAM::s3GetObjectAcl : rgw::IAM::s3GetObjectVersionAcl;
     if (!verify_object_permission(this, s, action)) {
       s->err.message = fmt::format("missing {} permission", rgw::IAM::action_bit_string(action));
       ldpp_dout(this, 4) << "ERROR: fetching object for replication object=" << s->object << " reason=" << s->err.message << dendl;
@@ -1311,7 +1312,7 @@ int RGWGetObj::verify_permission(optional_yield y)
     }
 
     // fallback to s3:GetObject(Version) permission
-    action = s->object->get_instance().empty() ? rgw::IAM::s3GetObject : rgw::IAM::s3GetObjectVersion;
+    action = s->object_key.instance.empty() ? rgw::IAM::s3GetObject : rgw::IAM::s3GetObjectVersion;
 
     // sse-kms is not supported by s3:GetObject(Version) permission
     bufferlist bl;
@@ -1322,9 +1323,9 @@ int RGWGetObj::verify_permission(optional_yield y)
       return -EACCES;
     }
   } else if (get_torrent) {
-    action = s->object->get_instance().empty() ? rgw::IAM::s3GetObjectTorrent : rgw::IAM::s3GetObjectVersionTorrent;
+    action = s->object_key.instance.empty() ? rgw::IAM::s3GetObjectTorrent : rgw::IAM::s3GetObjectVersionTorrent;
   } else {
-    action = s->object->get_instance().empty() ? rgw::IAM::s3GetObject : rgw::IAM::s3GetObjectVersion;
+    action = s->object_key.instance.empty() ? rgw::IAM::s3GetObject : rgw::IAM::s3GetObjectVersion;
   }
 
   if (!verify_object_permission(this, s, action)) {
@@ -1364,7 +1365,7 @@ int RGWOp::verify_op_mask()
 
 int RGWGetObjTags::verify_permission(optional_yield y)
 {
-  auto iam_action = s->object->get_instance().empty()?
+  auto iam_action = s->object_key.instance.empty() ?
     rgw::IAM::s3GetObjectTagging:
     rgw::IAM::s3GetObjectVersionTagging;
 
@@ -1403,7 +1404,7 @@ void RGWGetObjTags::execute(optional_yield y)
 
 int RGWPutObjTags::verify_permission(optional_yield y)
 {
-  auto iam_action = s->object->get_instance().empty() ?
+  auto iam_action = s->object_key.instance.empty() ?
     rgw::IAM::s3PutObjectTagging:
     rgw::IAM::s3PutObjectVersionTagging;
 
@@ -1464,7 +1465,7 @@ void RGWDeleteObjTags::pre_exec()
 int RGWDeleteObjTags::verify_permission(optional_yield y)
 {
   if (!rgw::sal::Object::empty(s->object.get())) {
-    auto iam_action = s->object->get_instance().empty() ?
+    auto iam_action = s->object_key.instance.empty() ?
       rgw::IAM::s3DeleteObjectTagging:
       rgw::IAM::s3DeleteObjectVersionTagging;
 
@@ -4371,7 +4372,7 @@ int RGWPutObj::verify_permission(optional_yield y)
     if (has_s3_existing_tag || has_s3_resource_tag)
       rgw_iam_add_objtags(this, s, cs_object.get(), has_s3_existing_tag, has_s3_resource_tag);
 
-    const auto action = cs_object->get_instance().empty() ?
+    const auto action = copy_source_version_id.empty() ?
         rgw::IAM::s3GetObject :
         rgw::IAM::s3GetObjectVersion;
 
@@ -4564,8 +4565,10 @@ int RGWPutObj::get_lua_filter(std::unique_ptr<rgw::sal::DataProcessor>* filter, 
 void RGWPutObj::execute(optional_yield y)
 {
   char supplied_md5_bin[CEPH_CRYPTO_MD5_DIGESTSIZE + 1];
-  char supplied_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
-  char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
+  std::string supplied_md5;
+  supplied_md5.reserve(CEPH_CRYPTO_MD5_DIGESTSIZE * 2);
+  std::string calc_md5;
+  calc_md5.reserve(CEPH_CRYPTO_MD5_DIGESTSIZE * 2);
   unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE];
   MD5 hash;
   // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
@@ -4615,7 +4618,7 @@ void RGWPutObj::execute(optional_yield y)
       return;
     }
 
-    buf_to_hex((const unsigned char *)supplied_md5_bin, CEPH_CRYPTO_MD5_DIGESTSIZE, supplied_md5);
+    buf_to_hex(std::span{supplied_md5_bin, CEPH_CRYPTO_MD5_DIGESTSIZE}, std::back_inserter(supplied_md5));
     ldpp_dout(this, 15) << "supplied_md5=" << supplied_md5 << dendl;
   }
 
@@ -4629,8 +4632,7 @@ void RGWPutObj::execute(optional_yield y)
   }
 
   if (supplied_etag) {
-    strncpy(supplied_md5, supplied_etag, sizeof(supplied_md5) - 1);
-    supplied_md5[sizeof(supplied_md5) - 1] = '\0';
+    supplied_md5 = supplied_etag;
   }
 
   const bool multipart = !multipart_upload_id.empty();
@@ -4926,11 +4928,11 @@ void RGWPutObj::execute(optional_yield y)
     }
   }
 
-  buf_to_hex(m, CEPH_CRYPTO_MD5_DIGESTSIZE, calc_md5);
+  buf_to_hex(m, std::back_inserter(calc_md5));
 
   etag = calc_md5;
 
-  if (supplied_md5_b64 && strcmp(calc_md5, supplied_md5)) {
+  if (supplied_md5_b64 && (calc_md5 != supplied_md5)) {
     op_ret = -ERR_BAD_DIGEST;
     return;
   }
@@ -5124,7 +5126,8 @@ void RGWPostObj::execute(optional_yield y)
 {
   boost::optional<RGWPutObj_Compress> compressor;
   CompressorRef plugin;
-  char supplied_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
+  std::string supplied_md5;
+  supplied_md5.reserve(CEPH_CRYPTO_MD5_DIGESTSIZE * 2);
 
   // make reservation for notification if needed
   std::unique_ptr<rgw::sal::Notification> res
@@ -5138,7 +5141,6 @@ void RGWPostObj::execute(optional_yield y)
   /* Start iteration over data fields. It's necessary as Swift's FormPost
    * is capable to handle multiple files in single form. */
   do {
-    char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
     unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE];
     MD5 hash;
     // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
@@ -5161,7 +5163,8 @@ void RGWPostObj::execute(optional_yield y)
         return;
       }
 
-      buf_to_hex((const unsigned char *)supplied_md5_bin, CEPH_CRYPTO_MD5_DIGESTSIZE, supplied_md5);
+      supplied_md5.clear();
+      buf_to_hex(std::span{supplied_md5_bin, CEPH_CRYPTO_MD5_DIGESTSIZE}, std::back_inserter(supplied_md5));
       ldpp_dout(this, 15) << "supplied_md5=" << supplied_md5 << dendl;
     }
 
@@ -5274,11 +5277,11 @@ void RGWPostObj::execute(optional_yield y)
     }
 
     hash.Final(m);
-    buf_to_hex(m, CEPH_CRYPTO_MD5_DIGESTSIZE, calc_md5);
+    etag.clear();
+    etag.reserve(CEPH_CRYPTO_MD5_DIGESTSIZE * 2);
+    buf_to_hex(m, std::back_inserter(etag));
 
-    etag = calc_md5;
-    
-    if (supplied_md5_b64 && strcmp(calc_md5, supplied_md5)) {
+    if (supplied_md5_b64 && etag != supplied_md5) {
       op_ret = -ERR_BAD_DIGEST;
       return;
     }
@@ -5694,7 +5697,7 @@ int RGWDeleteObj::verify_permission(optional_yield y)
     rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
 
   const auto arn = ARN{s->object->get_obj()};
-  const auto action = s->object->get_instance().empty() ?
+  const auto action = s->object_key.instance.empty() ?
       rgw::IAM::s3DeleteObject :
       rgw::IAM::s3DeleteObjectVersion;
 
@@ -5708,7 +5711,7 @@ int RGWDeleteObj::verify_permission(optional_yield y)
   }
 
   if (s->bucket->get_info().mfa_enabled() &&
-      !s->object->get_instance().empty() &&
+      !s->object_key.instance.empty() &&
       !s->mfa_verified) {
     ldpp_dout(this, 5) << "NOTICE: object delete request with a versioned object, mfa auth not provided" << dendl;
     return -ERR_MFA_REQUIRED;
@@ -5795,7 +5798,7 @@ void RGWDeleteObj::execute(optional_yield y)
     // make reservation for notification if needed
     const auto versioned_object = s->bucket->versioning_enabled();
     const auto event_type = versioned_object &&
-      s->object->get_instance().empty() ?
+      s->object_key.instance.empty() ?
       rgw::notify::ObjectRemovedDeleteMarkerCreated :
       rgw::notify::ObjectRemovedDelete;
     std::unique_ptr<rgw::sal::Notification> res
@@ -6180,7 +6183,7 @@ int RGWCopyObj::verify_permission(optional_yield y)
     if (has_s3_existing_tag || has_s3_resource_tag)
       rgw_iam_add_objtags(this, s, s->src_object.get(), has_s3_existing_tag, has_s3_resource_tag);
 
-    const auto action = s->src_object->get_instance().empty() ?
+    const auto action = s->src_object_key.instance.empty() ?
         rgw::IAM::s3GetObject :
         rgw::IAM::s3GetObjectVersion;
 
@@ -6464,7 +6467,7 @@ int RGWGetACLs::verify_permission(optional_yield y)
   bool perm;
   auto [has_s3_existing_tag, has_s3_resource_tag] = rgw_check_policy_condition(this, s);
   if (!rgw::sal::Object::empty(s->object.get())) {
-    auto iam_action = s->object->get_instance().empty() ?
+    auto iam_action = s->object_key.instance.empty() ?
       rgw::IAM::s3GetObjectAcl :
       rgw::IAM::s3GetObjectVersionAcl;
     if (has_s3_existing_tag || has_s3_resource_tag)
@@ -6508,7 +6511,7 @@ int RGWPutACLs::verify_permission(optional_yield y)
 
   rgw_add_grant_to_iam_environment(s->env, s);
   if (!rgw::sal::Object::empty(s->object.get())) {
-    auto iam_action = s->object->get_instance().empty() ? rgw::IAM::s3PutObjectAcl : rgw::IAM::s3PutObjectVersionAcl;
+    auto iam_action = s->object_key.instance.empty() ? rgw::IAM::s3PutObjectAcl : rgw::IAM::s3PutObjectVersionAcl;
     op_ret = rgw_iam_add_objtags(this, s, true, true);
     perm = verify_object_permission(this, s, iam_action);
   } else {
@@ -6553,11 +6556,11 @@ int RGWGetObjAttrs::verify_permission(optional_yield y)
 
   if (! rgw::sal::Object::empty(s->object.get())) {
 
-    auto iam_action1 = s->object->get_instance().empty() ?
+    auto iam_action1 = s->object_key.instance.empty() ?
       rgw::IAM::s3GetObject :
       rgw::IAM::s3GetObjectVersion;
 
-    auto iam_action2 = s->object->get_instance().empty() ?
+    auto iam_action2 = s->object_key.instance.empty() ?
       rgw::IAM::s3GetObjectAttributes :
       rgw::IAM::s3GetObjectVersionAttributes;
 
@@ -6692,8 +6695,12 @@ void RGWPutACLs::execute(optional_yield y)
   if (op_ret < 0)
     return;
 
+  // only allow acl owner to change if the requester views them as equivalent.
+  // the requester may change between their user id and account id.
   if (!existing_owner.empty() &&
-      existing_owner.id != new_policy.get_owner().id) {
+      existing_owner.id != new_policy.get_owner().id &&
+      !(s->auth.identity->is_owner_of(existing_owner.id) &&
+        s->auth.identity->is_owner_of(new_policy.get_owner().id))) {
     s->err.message = "Cannot modify ACL Owner";
     op_ret = -EPERM;
     return;
@@ -7661,18 +7668,51 @@ bool RGWCompleteMultipart::check_previously_completed(const RGWMultiCompleteUplo
   }
 
   unsigned char final_etag[CEPH_CRYPTO_MD5_DIGESTSIZE];
-  char final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16];
+  std::string final_etag_str;
+  final_etag_str.reserve(CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16);
   hash.Final(final_etag);
-  buf_to_hex(final_etag, CEPH_CRYPTO_MD5_DIGESTSIZE, final_etag_str);
-  snprintf(&final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2], sizeof(final_etag_str) - CEPH_CRYPTO_MD5_DIGESTSIZE * 2,
-           "-%lld", (long long)parts->parts.size());
+  buf_to_hex(final_etag, std::back_inserter(final_etag_str));
+  fmt::format_to(std::back_inserter(final_etag_str), "-{}", parts->parts.size());
 
   if (oetag.compare(final_etag_str) != 0) {
     ldpp_dout(this, 1) << __func__ << "() NOTICE: etag mismatch: object etag:"
                                   << oetag << ", re-calculated etag:" << final_etag_str << dendl;
     return false;
   }
-  ldpp_dout(this, 5) << __func__ << "() object etag and re-calculated etag match, etag: " << oetag << dendl;
+  ldpp_dout(this, 5) << __func__
+                     << "() object etag and re-calculated etag match, etag: "
+                     << oetag << dendl;
+  etag = oetag;
+
+  /* assign cksum and armored_cksum */
+  auto iter = sattrs.find(RGW_ATTR_CKSUM);
+  if (iter != sattrs.end()) {
+    auto bliter = iter->second.cbegin();
+    try {
+      rgw::cksum::Cksum tcksum;
+      tcksum.decode(bliter);
+      cksum = std::move(tcksum);
+
+      /* extract a multipart etag's part-count suffix, or "" if
+       * (impossibly) it's not present */
+      auto extract_part_count = [](std::string& etag) -> std::string {
+        std::string str{""};
+        auto pos = etag.find("-");
+        if (pos != std::string::npos) {
+          str = etag.substr(pos, etag.length()-pos);
+        }
+          return str;
+      };
+
+      armored_cksum = cksum->to_armor();
+      if (cksum->composite()) {
+        *armored_cksum += extract_part_count(etag);
+      }
+    } catch (buffer::error& err) {
+      ldpp_dout(this, 0) << "ERROR: could not decode stored cksum, caught buffer::error" << dendl;
+    }
+  }
+
   return true;
 }
 
@@ -7983,7 +8023,7 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
 
   // make reservation for notification if needed
   const auto versioned_object = s->bucket->versioning_enabled();
-  const auto event_type = versioned_object && obj->get_instance().empty() ?
+  const auto event_type = versioned_object && o.instance.empty() ?
                           rgw::notify::ObjectRemovedDeleteMarkerCreated :
                           rgw::notify::ObjectRemovedDelete;
   std::unique_ptr<rgw::sal::Notification> res
@@ -8029,68 +8069,33 @@ void RGWDeleteMultiObj::handle_individual_object(const RGWMultiDelObject& object
   send_partial_response(o, del_op->result.delete_marker, del_op->result.version_id, op_ret);
 }
 
-void RGWDeleteMultiObj::handle_versioned_objects(const std::vector<RGWMultiDelObject>& objects,
-                                                 uint32_t max_aio,
-                                                 boost::asio::yield_context yield)
-{
-  auto group = ceph::async::spawn_throttle{yield, max_aio};
-  std::map<std::string, std::vector<RGWMultiDelObject>> grouped_objects;
-
-  // group objects by their keys
-  for (const auto& object : objects) {
-    const std::string& key = object.get_key();
-    grouped_objects[key].push_back(object);
-  }
-
-  // for each group of objects, handle all but the last object and skip update_olh
-  for (const auto& [_, objects] : grouped_objects) {
-    for (size_t i = 0; i + 1 < objects.size(); ++i) { // skip the last element
-      group.spawn([this, &objects, i] (boost::asio::yield_context yield) {
-        handle_individual_object(objects[i], yield, true /* skip_olh_obj_update */);
-      });
-
-      rgw_flush_formatter(s, s->formatter);
-    }
-  }
-  group.wait();
-
-  // Now handle the last object of each group with update_olh
-  for (const auto& [_, objects] : grouped_objects) {
-    const auto& object = objects.back();
-    group.spawn([this, &object] (boost::asio::yield_context yield) {
-      handle_individual_object(object, yield);
-    });
-
-    rgw_flush_formatter(s, s->formatter);
-  }
-  group.wait();
-}
-
-void RGWDeleteMultiObj::handle_non_versioned_objects(const std::vector<RGWMultiDelObject>& objects,
-                                                     uint32_t max_aio,
-                                                     boost::asio::yield_context yield)
-{
-  auto group = ceph::async::spawn_throttle{yield, max_aio};
-
-  for (const auto& object : objects) {
-    group.spawn([this, &object] (boost::asio::yield_context yield) {
-                  handle_individual_object(object, yield);
-                });
-
-    rgw_flush_formatter(s, s->formatter);
-  }
-  group.wait();
-}
-
 void RGWDeleteMultiObj::handle_objects(const std::vector<RGWMultiDelObject>& objects,
                                        uint32_t max_aio,
                                        boost::asio::yield_context yield)
 {
-  if (bucket->versioned()) {
-    handle_versioned_objects(objects, max_aio, yield);
-  } else {
-    handle_non_versioned_objects(objects, max_aio, yield);
+  std::vector<rgw::multi_delete::Item> items;
+  items.reserve(objects.size());
+
+  for (size_t i = 0; i < objects.size(); ++i) {
+    items.push_back(rgw::multi_delete::Item{
+      rgw_obj_key(objects[i].get_key(), objects[i].get_version_id()),
+      i,
+    });
   }
+
+  rgw::multi_delete::dispatch(
+      items,
+      bucket->versioned(),
+      max_aio,
+      yield,
+      [this, &objects] (const rgw::multi_delete::Item& item,
+                        bool skip_update_olh,
+                        boost::asio::yield_context y) {
+        handle_individual_object(objects[item.index], y, skip_update_olh);
+      },
+      [this] {
+        rgw_flush_formatter(s, s->formatter);
+      });
 }
 
 void RGWDeleteMultiObj::execute(optional_yield y)
@@ -8676,17 +8681,18 @@ int RGWBulkUploadOp::handle_file(const std::string_view path,
     return op_ret;
   }
 
-  char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
   unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE];
   hash.Final(m);
-  buf_to_hex(m, CEPH_CRYPTO_MD5_DIGESTSIZE, calc_md5);
+  ceph::bufferlist etag_bl;
+  append_bl(etag_bl, CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1, [&](auto iter) {
+    iter = buf_to_hex(m, iter);
+    *iter++ = '\0';
+    return iter;
+  });
 
   /* Create metadata: ETAG. */
   std::map<std::string, ceph::bufferlist> attrs;
-  std::string etag = calc_md5;
-  ceph::bufferlist etag_bl;
-  etag_bl.append(etag.c_str(), etag.size() + 1);
-  attrs.emplace(RGW_ATTR_ETAG, std::move(etag_bl));
+  attrs.emplace(RGW_ATTR_ETAG, etag_bl);
 
   /* Create metadata: ACLs. */
   RGWAccessControlPolicy policy;
@@ -8714,7 +8720,7 @@ int RGWBulkUploadOp::handle_file(const std::string_view path,
 
   /* Complete the transaction. */
   const req_context rctx{this, s->yield, s->trace.get()};
-  op_ret = processor->complete(size, etag, nullptr, ceph::real_time(),
+  op_ret = processor->complete(size, etag_bl.c_str(), nullptr, ceph::real_time(),
 			       attrs, rgw::cksum::no_cksum,
 			       ceph::real_time() /* delete_at */,
 			       nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -8858,7 +8864,7 @@ int RGWGetAttrs::verify_permission(optional_yield y)
     if (has_s3_existing_tag || has_s3_resource_tag)
       rgw_iam_add_objtags(this, s, has_s3_existing_tag, has_s3_resource_tag);
 
-  auto iam_action = s->object->get_instance().empty() ?
+  auto iam_action = s->object_key.instance.empty() ?
     rgw::IAM::s3GetObject :
     rgw::IAM::s3GetObjectVersion;
 

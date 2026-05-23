@@ -501,9 +501,6 @@ def make_data_dir_base(fsid, data_dir, uid, gid):
     # type: (str, str, int, int) -> str
     data_dir_base = os.path.join(data_dir, fsid)
     makedirs(data_dir_base, uid, gid, DATA_DIR_MODE)
-    makedirs(os.path.join(data_dir_base, 'crash'), uid, gid, DATA_DIR_MODE)
-    makedirs(os.path.join(data_dir_base, 'crash', 'posted'), uid, gid,
-             DATA_DIR_MODE)
     return data_dir_base
 
 
@@ -858,8 +855,10 @@ def get_ceph_volume_container(ctx: CephadmContext,
                               envs: Optional[List[str]] = None) -> 'CephContainer':
     if envs is None:
         envs = []
-    envs.append('CEPH_VOLUME_SKIP_RESTORECON=yes')
-    envs.append('CEPH_VOLUME_DEBUG=1')
+    if 'CEPH_VOLUME_SKIP_RESTORECON=yes' not in envs:
+        envs.append('CEPH_VOLUME_SKIP_RESTORECON=yes')
+    if 'CEPH_VOLUME_DEBUG=1' not in envs:
+        envs.append('CEPH_VOLUME_DEBUG=1')
 
     return CephContainer(
         ctx,

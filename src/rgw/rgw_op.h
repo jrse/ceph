@@ -2265,10 +2265,6 @@ class RGWDeleteMultiObj : public RGWOp {
                                 optional_yield y,
                                 const bool skip_olh_obj_update = false);
 
-  void handle_versioned_objects(const std::vector<RGWMultiDelObject>& objects,
-                                uint32_t max_aio, boost::asio::yield_context yield);
-  void handle_non_versioned_objects(const std::vector<RGWMultiDelObject>& objects,
-                                    uint32_t max_aio, boost::asio::yield_context yield);
   void handle_objects(const std::vector<RGWMultiDelObject>& objects,
                       uint32_t max_aio, boost::asio::yield_context yield);
 
@@ -2495,16 +2491,17 @@ inline int encode_dlo_manifest_attr(const char * const dlo_manifest,
   return 0;
 } /* encode_dlo_manifest_attr */
 
-inline void complete_etag(MD5& hash, std::string *etag)
+inline void complete_etag(MD5& hash, std::string* etag)
 {
+  if (!etag) {
+    return;
+  }
   char etag_buf[CEPH_CRYPTO_MD5_DIGESTSIZE];
-  char etag_buf_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16];
 
   hash.Final((unsigned char *)etag_buf);
-  buf_to_hex((const unsigned char *)etag_buf, CEPH_CRYPTO_MD5_DIGESTSIZE,
-	    etag_buf_str);
-
-  *etag = etag_buf_str;
+  etag->clear();
+  etag->reserve(CEPH_CRYPTO_MD5_DIGESTSIZE * 2);
+  buf_to_hex(etag_buf, std::back_inserter(*etag));
 } /* complete_etag */
 
 using boost::container::flat_map;

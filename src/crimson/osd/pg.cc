@@ -346,34 +346,6 @@ void PG::recheck_readable()
   }
 }
 
-bool PG::should_send_op(pg_shard_t peer, const hobject_t &hoid)
-{
-  if (peer == get_primary()) {
-    return true;
-  }
-  bool should_send =
-    hoid.pool != (int64_t)get_pgid().pool() ||
-    hoid <= peering_state.get_peer_info(peer).last_backfill ||
-    (recovery_handler->backfill_state &&
-      hoid <= recovery_handler->backfill_state->get_last_backfill_started());
-  if (!should_send) {
-    ceph_assert(is_backfill_target(peer));
-    logger().debug("{}: {} shipping empty opt to osd.{}, object {}"
-		   " beyond std::max(last_backfill_started,"
-		   " peer_info[peer].last_backfill {})",
-		   *this, __func__, peer, hoid,
-		   peering_state.get_peer_info(peer).last_backfill);
-    return should_send;
-  }
-  if (peering_state.is_async_recovery_target(peer) &&
-      peering_state.get_peer_missing(peer).is_missing(hoid)) {
-    should_send = false;
-    logger().info("{}: {} shipping empty opt to osd.{}, object {}"
-		  " which is pending recovery in async_recovery_targets",
-		 *this, __func__, peer, hoid);
-  }
-  return should_send;
-}
 unsigned PG::get_target_pg_log_entries() const
 {
   const unsigned local_num_pgs = shard_services.get_num_local_pgs();
@@ -535,6 +507,17 @@ PG::do_delete_work(ceph::os::Transaction &t, ghobject_t _next)
     t.remove(coll_ref->get_cid(), pgid.make_snapmapper_oid());
     t.remove(coll_ref->get_cid(), pgmeta_oid);
     t.remove_collection(coll_ref->get_cid());
+    /*
+     * Mark the PG as fully deleted *before* dispatching the final
+     * RMCOLL transaction.  A PGAdvanceMap may already have been queued
+     * (with a Ref<PG>) by an earlier broadcast_map_to_pgs while this
+     * PG was still in pg_map, and is now sitting behind these
+     * DeleteSome events on the peering pipeline.  Setting the deleted
+     * flag now lets that queued PGAdvanceMap detect the situation and
+     * skip itself instead of issuing ops on a collection that is
+     * about to disappear.
+     */
+    peering_state.set_delete_complete();
     (void) crimson::os::with_store_do_transaction(
       shard_services.get_store(store_index),
       coll_ref,
@@ -644,6 +627,12 @@ PG::interruptible_future<seastar::stop_iteration> PG::trim_snap(
 
 void PG::on_active_actmap()
 {
+  logger().debug("{}: {}", *this, __func__);
+  initiate_snap_trim();
+}
+
+void PG::initiate_snap_trim()
+{
   logger().debug("{}: {} snap_trimq={}", *this, __func__, snap_trimq);
   peering_state.state_clear(PG_STATE_SNAPTRIM_ERROR);
   if (peering_state.is_active() && peering_state.is_clean()) {
@@ -651,7 +640,16 @@ void PG::on_active_actmap()
       logger().debug("{}: {} already trimming.", *this, __func__);
       return;
     }
-    // loops until snap_trimq is empty or SNAPTRIM_ERROR.
+    // Temporary: defer snap trimming while scrubbing, until the full scrub
+    // scheduling code (including is_scrub_queued_or_active()) is merged.
+    // (mark https://tracker.ceph.com/issues/76428 as solved once fixed).
+    if (peering_state.state_test(PG_STATE_SCRUBBING)) {
+      logger().info("{}: {} scrubbing, deferring snap trim", *this, __func__);
+      return;
+    }
+    if (snap_trimq.empty()) {
+      return;
+    }
     Ref<PG> pg_ref = this;
     std::ignore = interruptor::with_interruption([this] {
       return interruptor::repeat(
@@ -668,7 +666,7 @@ void PG::on_active_actmap()
           return trim_snap(to_trim, needs_pause);
         }
       ).then_interruptible([this] {
-        logger().debug("{}: PG::on_active_actmap() finished trimming",
+        logger().debug("{}: PG::initiate_snap_trim() finished trimming",
                        *this);
         peering_state.state_clear(PG_STATE_SNAPTRIM);
         peering_state.state_clear(PG_STATE_SNAPTRIM_ERROR);
@@ -682,6 +680,16 @@ void PG::on_active_actmap()
   } else {
     logger().debug("pg not clean, skipping snap trim");
     ceph_assert(!peering_state.state_test(PG_STATE_SNAPTRIM));
+  }
+}
+
+void PG::kick_snap_trim()
+{
+  if (peering_state.is_active() && peering_state.is_clean()
+      && !snap_trimq.empty()
+      && !peering_state.state_test(PG_STATE_SNAPTRIM)) {
+    logger().info("{}: scrub complete, retriggering snap trim", *this);
+    (void) shard_services.start_operation<SnapTrimInitiate>(this);
   }
 }
 
@@ -1712,7 +1720,8 @@ void PG::on_change(ceph::os::Transaction &t) {
   // is save and in time.
   peering_state.state_clear(PG_STATE_SNAPTRIM);
   peering_state.state_clear(PG_STATE_SNAPTRIM_ERROR);
-  snap_mapper.reset_backend();
+  auto _t = osdriver.get_transaction(&t);
+  snap_mapper.flush_and_reset_backend(&_t);
   reset_pglog_based_recovery_op();
 }
 
@@ -1801,31 +1810,35 @@ bool PG::is_degraded_or_backfilling_object(const hobject_t& soid) const {
 
 bool PG::should_send_op(
   pg_shard_t peer,
-  const hobject_t &hoid) const
+  const hobject_t &hoid)
 {
   if (peer == get_primary())
     return true;
   bool should_send =
     (hoid.pool != (int64_t)get_info().pgid.pool() ||
-    // An object has been fully pushed to the backfill target if and only if
-    // either of the following conditions is met:
-    // 1. peer_info.last_backfill has passed "hoid"
-    // 2. last_backfill_started has passed "hoid" and "hoid" is not in the peer
-    //    missing set
-    hoid <= peering_state.get_peer_info(peer).last_backfill ||
-    (has_backfill_state() && hoid <= get_last_backfill_started() &&
-     !is_missing_on_peer(peer, hoid)));
-  if (!should_send) {
-    ceph_assert(is_backfill_target(peer));
-    logger().debug("{} issue_repop shipping empty opt to osd."
-                   "{}, object {} beyond std::max(last_backfill_started, "
-                   "peer_info[peer].last_backfill {})",
-                   __func__, peer, hoid,
-                   peering_state.get_peer_info(peer).last_backfill);
+     // An object has been fully pushed to the backfill target if and only if
+     // hoid is not in the peer's missing set and either of the following
+     // conditions is met:
+     // 1. peer_info.last_backfill has passed "hoid"
+     // 2. last_backfill_started has passed "hoid"
+     hoid <= peering_state.get_peer_info(peer).last_backfill ||
+     (has_backfill_state() && hoid <= get_last_backfill_started())) &&
+    !is_missing_on_peer(peer, hoid);
+  if (unlikely(!should_send)) {
+    if (peering_state.is_async_recovery_target(peer)) {
+      logger().info("{}: {} shipping empty opt to osd.{}, object {}"
+                    " which is pending recovery in async_recovery_targets",
+                   *this, __func__, peer, hoid);
+    } else {
+      ceph_assert(is_backfill_target(peer));
+      logger().debug("{} issue_repop shipping empty opt to osd."
+                     "{}, object {} beyond std::max(last_backfill_started, "
+                     "peer_info[peer].last_backfill {})",
+                     __func__, peer, hoid,
+                     peering_state.get_peer_info(peer).last_backfill);
+    }
   }
   return should_send;
-  // TODO: should consider async recovery cases in the future which are not supported
-  //       by crimson yet
 }
 
 void PG::op_applied(const eversion_t &applied_version)

@@ -22,7 +22,13 @@ from ceph.deployment.hostspec import SpecValidationError
 from ceph.deployment.utils import unwrap_ipv6
 from ceph.utils import datetime_now
 from ceph.cephadm.images import NonCephImageServiceTypes
-from mgr_util import to_pretty_timedelta, format_bytes, parse_combined_pem_file, NvmeofMetadataPoolHelper
+from mgr_util import (
+    is_valid_container_image_ref,
+    to_pretty_timedelta,
+    format_bytes,
+    parse_combined_pem_file,
+    NvmeofMetadataPoolHelper,
+)
 from mgr_module import MgrModule, HandleCommandResult, Option
 from object_format import Format
 
@@ -1639,10 +1645,19 @@ Usage:
             table._align['PGS'] = 'r'
             table.left_padding_width = 0
             table.right_padding_width = 2
-            for osd in sorted(report, key=lambda o: o.osd_id):
-                table.add_row([osd.osd_id, osd.hostname, osd.drain_status_human(),
-                               osd.get_pg_count(), osd.replace, osd.force, osd.zap,
-                               osd.drain_started_at or ''])
+            for osd in sorted(report, key=lambda o: o.get('osd_id')):
+                table.add_row(
+                    [
+                        osd.get('osd_id'),
+                        osd.get('hostname'),
+                        osd.get('drain_status'),
+                        osd.get('pg_count'),
+                        osd.get('replace'),
+                        osd.get('force'),
+                        osd.get('zap'),
+                        osd.get('drain_started_at') or ''
+                    ]
+                )
             out = table.get_string()
 
         return HandleCommandResult(stdout=out)
@@ -1791,11 +1806,16 @@ Usage:
     @OrchestratorCLICommand.Write('orch daemon redeploy')
     def _daemon_action_redeploy(self,
                                 name: str,
-                                image: Optional[str] = None) -> HandleCommandResult:
+                                image: Optional[str] = None,
+                                force: bool = False) -> HandleCommandResult:
         """Redeploy a daemon (with a specific image)"""
         if '.' not in name:
             raise OrchestratorError('%s is not a valid daemon name' % name)
-        completion = self.daemon_action("redeploy", name, image=image)
+        if image is not None and not is_valid_container_image_ref(image):
+            raise OrchestratorError(
+                f'Invalid container image {image!r} (not a valid container image reference)'
+            )
+        completion = self.daemon_action("redeploy", name, image=image, force=force)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 
@@ -2106,12 +2126,15 @@ Usage:
                             no_overwrite: bool = False,
                             inbuf: Optional[str] = None) -> HandleCommandResult:
         """Add a cluster gateway service (cephadm only)"""
+        if inbuf:
+            raise OrchestratorValidationError('unrecognized command -i; -h or --help for usage')
 
         spec = OAuth2ProxySpec(
             placement=PlacementSpec.from_string(placement),
             unmanaged=unmanaged,
-            https_address=https_address
+            https_address=https_address,
         )
+        spec.preview_only = dry_run
 
         spec.validate()  # force any validation exceptions to be caught correctly
 
@@ -2586,13 +2609,17 @@ Usage:
                        hosts: Optional[str] = None,
                        services: Optional[str] = None,
                        limit: Optional[int] = None,
-                       ceph_version: Optional[str] = None) -> HandleCommandResult:
+                       ceph_version: Optional[str] = None,
+                       crush_bucket_type: Optional[str] = None,
+                       crush_bucket_name: Optional[str] = None) -> HandleCommandResult:
         """Initiate upgrade"""
         self._upgrade_check_image_name(image, ceph_version)
+
         # Split comma-separated lists and trim whitespace so "mon, crash" and "mon,crash" are equivalent.
         dtypes = [d.strip() for d in daemon_types.split(',')] if daemon_types is not None else None
         service_names = [s.strip() for s in services.split(',')] if services is not None else None
-        completion = self.upgrade_start(image, ceph_version, dtypes, hosts, service_names, limit)
+        completion = self.upgrade_start(image, ceph_version, dtypes, hosts, service_names, limit,
+                                        crush_bucket_type, crush_bucket_name)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 

@@ -218,6 +218,8 @@ if(WITH_RADOSGW_RADOS)
           driver/rados/rgw_trim_datalog.cc
           driver/rados/rgw_trim_mdlog.cc
           driver/rados/rgw_user.cc
+          driver/rados/oidc.cc
+          driver/rados/oidcs.cc
           driver/rados/role.cc
           driver/rados/roles.cc
           driver/rados/sync_fairness.cc
@@ -234,6 +236,7 @@ if(WITH_RADOSGW_RADOS)
           driver/rados/config/zone.cc
           driver/rados/config/zonegroup.cc
           driver/rados/rgw_dedup.cc
+          driver/rados/rgw_dedup_filter.cc
           driver/rados/rgw_dedup_table.cc
           driver/rados/rgw_dedup_store.cc
           driver/rados/rgw_dedup_utils.cc
@@ -293,6 +296,12 @@ check_cxx_compiler_flag("-Wimplicit-const-int-float-conversion"
 if(COMPILER_SUPPORTS_WARN_IMPLICIT_CONST_INT_FLOAT_CONVERSION)
   target_compile_definitions(common-objs PRIVATE
     HAVE_WARN_IMPLICIT_CONST_INT_FLOAT_CONVERSION)
+endif()
+
+if(COMPILER_SUPPORTS_VLA_ERROR)
+  # Will be picked up by anyone including rgw_common
+  target_compile_options(rgw_common PUBLIC
+    $<$<COMPILE_LANGUAGE:CXX>:-Werror=vla>)
 endif()
 
 target_link_libraries(rgw_common
@@ -460,7 +469,7 @@ if(WITH_RADOSGW_AMQP_ENDPOINT)
   find_package(RabbitMQ REQUIRED)
 endif()
 if(WITH_RADOSGW_KAFKA_ENDPOINT)
-  find_package(RDKafka 0.9.2 REQUIRED)
+  find_package(RDKafka 1.1.0 REQUIRED)
 endif()
 
 target_link_libraries(rgw_a
@@ -490,12 +499,15 @@ set(rgw_schedulers_srcs
 add_library(rgw_schedulers STATIC ${rgw_schedulers_srcs})
 target_link_libraries(rgw_schedulers
   PUBLIC dmclock::dmclock Boost::context)
+if(COMPILER_SUPPORTS_VLA_ERROR)
+  target_compile_options(rgw_schedulers PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Werror=vla>)
+endif()
 
 set(radosgw_srcs
   rgw_main.cc)
 
 add_executable(radosgw ${radosgw_srcs})
-
 if(WITH_RADOSGW_ARROW_FLIGHT)
   # target_compile_definitions(radosgw PUBLIC WITH_ARROW_FLIGHT)
   target_compile_definitions(rgw_common PUBLIC WITH_ARROW_FLIGHT)
@@ -574,6 +586,9 @@ target_link_libraries(radosgw-token
   legacy-option-headers
   librados
   global)
+if(COMPILER_SUPPORTS_VLA_ERROR)
+  target_compile_options(radosgw-token PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Werror=vla>)
+endif()
 install(TARGETS radosgw-token DESTINATION bin)
 
 if(WITH_RADOSGW_RADOS)

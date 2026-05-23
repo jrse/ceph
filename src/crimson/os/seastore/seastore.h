@@ -190,6 +190,7 @@ public:
   // only exposed to SeaStore
   public:
     base_ertr::future<> umount();
+    seastar::future<> do_gc();
     // init managers and mount transaction_manager
     seastar::future<> mount_managers();
 
@@ -401,6 +402,11 @@ public:
     tm_ret _split_collection(
       internal_context_t &ctx,
       const coll_t& cid, int bits);
+    tm_ret _merge_collection(
+      internal_context_t &ctx,
+      coll_t cid,
+      coll_t dest_cid,
+      int bits);
     tm_ret _remove_collection(
       internal_context_t &ctx,
       const coll_t& cid);
@@ -592,6 +598,8 @@ public:
   seastar::future<std::vector<coll_core_t>> list_collections() override;
 
   seastar::future<std::string> get_default_device_class() final;
+
+  seastar::future<> do_gc() override;
 
   BackendStore get_backend_store(store_index_t store_index) override {
     assert(!shard_stores.local().mshard_stores.empty());

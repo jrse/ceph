@@ -4,6 +4,11 @@
   developers must update their method calls to use these new structs, which ensure
   read/write semantics are correctly applied.
 
+* RGW: S3 ListObjects and ListObjectVersions now support the
+  ``x-amz-optional-object-attributes: RestoreStatus`` request header to include
+  restore status in listing responses. Restore status is stored in the bucket
+  index, so only objects written or restored after this upgrade will populate
+  the field. Existing objects are unaffected.
 * ceph-volume: Raw BlueStore OSD preparation now pre-formats NVMe devices and
   skips the slower BlueStore discard phase,reducing mkfs time on
   very large namespaces.
@@ -21,7 +26,7 @@
     it must be explicitly loaded in the configuration file or code (see https://github.com/openssl/openssl/blob/master/README-PROVIDERS.md).
 * RGW: Fixed bucket notification events so the 'x_amz_request_id' in NotificationEvent now matches the 'x_amz_request_id' returned by the corresponding S3 operation.
 
-
+* DASHBOARD: Introduces a new landing page - "Overview". This revamps UX and adds more information in the landing page - overall cluster health, health checks, resilency panel (showing PG status, active/clean percent), total and used raw capacity, alerts, capacity breakdown by object, file and block and performance charts - throughput, latency and IOPS. This renames the landing page from "Dashboard" to "Overview"
 * DASHBOARD: Removed the older landing page which was deprecated in Quincy.
   Admins can no longer enable the older, deprecated landing page layout by
   adjusting FEATURE_TOGGLE_DASHBOARD.
@@ -87,6 +92,12 @@
   configured ratio of the main OSD data device size. This warning is
   informational and can be muted with:
   ``ceph health mute BLUESTORE_BLUEFS_OVERSIZED``
+* MGR: The Manager now automatically increases ``mgr_stats_period`` when its
+  message queue is congested, reducing daemon reporting frequency to prevent
+  overload. The period recovers automatically once the queue clears. This
+  behavior is controlled by the new ``mgr_stats_period_autotune`` (default:
+  ``true``) and ``mgr_stats_period_autotune_queue_threshold`` (default: ``100``)
+  config options.
 
 >=20.0.0
 
@@ -294,6 +305,7 @@
 * Dashboard: RGW Topics and Bucket Notification Management
 * Dashboard: RGW granular bucket replication
 * Dashboard: SMB monitoring and management
+* Dashboard: `ceph dashboard sso enable oauth2` checks for oauth2-proxy service for SSO enablement.  If the `oauth2-proxy` service goes down, cephadm will automatically disable Dashboard OAuth2 SSO.
 * Monitoring: New monitoring Dashboards for Application, NVMe, CephFS, and SMB Overview
 * RGW: Introduce the `rgw_usage_log_key_transition` configuration option to handle
   the co-existence of old and new usage log keys. This option is enabled by default

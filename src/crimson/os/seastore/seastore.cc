@@ -427,6 +427,31 @@ base_ertr::future<> SeaStore::Shard::umount()
   onode_manager.reset();
 }
 
+seastar::future<> SeaStore::Shard::do_gc()
+{
+  LOG_PREFIX(SeaStore::Shard::do_gc);
+  if (!store_active || !transaction_manager) {
+    co_return;
+  }
+  auto *epm = transaction_manager->get_epm();
+  INFO("stopping background and running cleaner...");
+  co_await epm->stop_background();
+  co_await epm->run_cleaner_until_done();
+  INFO("done");
+}
+
+seastar::future<> SeaStore::do_gc()
+{
+  LOG_PREFIX(SeaStore::do_gc);
+  INFO("...");
+  co_await shard_stores.invoke_on_all([](auto &local_store) {
+    return seastar::do_for_each(local_store.mshard_stores, [](auto& mshard_store) {
+      return mshard_store->do_gc();
+    });
+  });
+  INFO("done");
+}
+
 seastar::future<> SeaStore::write_fsid(uuid_d new_osd_fsid)
 {
   ceph_assert(seastar::this_shard_id() == primary_core);
@@ -1410,6 +1435,9 @@ seastar::future<struct stat> SeaStore::Shard::stat(
     [this, oid](auto &t, auto &onode) {
     return _stat(t, onode, oid);
   }).handle_error(
+    crimson::ct_error::enoent::handle([] {
+      return seastar::make_ready_future<struct stat>();
+    }),
     crimson::ct_error::assert_all{
       "Invalid error in SeaStoreS::stat"
     }
@@ -1753,6 +1781,15 @@ SeaStore::Shard::_do_transaction_step(
       DEBUGT("op OP_SPLIT_COLLECTION2, cid={}, dest_cid={}, bits={}",
 	*ctx.transaction, cid, dest_cid, bits);
       return _split_collection(ctx, cid, bits);
+    }
+    case Transaction::OP_MERGE_COLLECTION:
+    {
+      uint32_t bits = op->split_bits;
+      coll_t cid = i.get_cid(op->cid);
+      coll_t dest_cid = i.get_cid(op->dest_cid);
+      DEBUGT("op OP_MERGE_COLLECTION, cid={}, dest_cid={}, bits={}",
+	*ctx.transaction, cid, dest_cid, bits);
+      return _merge_collection(ctx, cid, dest_cid, bits);
     }
   }
 
@@ -2448,6 +2485,25 @@ SeaStore::Shard::_split_collection(
       "Invalid error in SeaStoreS::_create_collection"
     }
   );
+}
+
+SeaStore::Shard::tm_ret
+SeaStore::Shard::_merge_collection(
+  internal_context_t &ctx,
+  coll_t cid,
+  coll_t dest_cid,
+  int bits)
+{
+  auto cmroot = co_await transaction_manager->read_collection_root(
+    *ctx.transaction);
+  co_await collection_manager->update(cmroot, *ctx.transaction, dest_cid, bits)
+    .handle_error_interruptible(
+      tm_iertr::pass_further{},
+      crimson::ct_error::assert_all{"unexpected error from update in _merge_collection"});
+  co_await collection_manager->remove(cmroot, *ctx.transaction, cid)
+    .handle_error_interruptible(
+      tm_iertr::pass_further{},
+      crimson::ct_error::assert_all{"unexpected error from remove in _merge_collection"});
 }
 
 SeaStore::Shard::tm_ret

@@ -166,12 +166,62 @@ previous example. Set three CTDB public address values and a custom placement:
         --placement="3 label:smb"
 
 
+Update Cluster QoS
+++++++++++++++++++
+
+.. prompt:: bash #
+
+   ceph smb cluster update cephfs qos <cluster_id> [--read-iops-limit=<int>] [--write-iops-limit=<int>] [--read-bw-limit=<str>] [--write-bw-limit=<str>] [--read-burst-mult=<int>] [--write-burst-mult=<int>]
+
+Update Quality of Service (QoS) settings for all CephFS-backed shares within a cluster. This command applies the same per-share QoS limits to every share in the specified cluster that has CephFS storage configured. This is particularly useful for clusters with many shares that require uniform QoS policies.
+
+Options: See :ref:`qos-parameters` for detailed descriptions of all QoS parameters.
+
+Examples:
+
+Apply the same IOPS limits to all shares in a cluster:
+
+.. prompt:: bash #
+
+   ceph smb cluster update cephfs qos prod \
+     --read-iops-limit=1000 \
+     --write-iops-limit=500
+
+Apply bandwidth limits with human-readable units to all shares:
+
+.. prompt:: bash #
+
+   ceph smb cluster update cephfs qos prod \
+     --read-bw-limit="10M" \
+     --write-bw-limit="5M"
+
+Apply QoS limits with burst multipliers to all shares:
+
+.. prompt:: bash #
+
+   ceph smb cluster update cephfs qos prod \
+     --read-iops-limit=100 \
+     --write-iops-limit=200 \
+     --read-burst-mult=20 \
+     --write-burst-mult=15
+
+Disable QoS for all shares in a cluster:
+
+.. prompt:: bash #
+
+   ceph smb cluster update cephfs qos prod \
+     --read-iops-limit=0 \
+     --write-iops-limit=0 \
+     --read-bw-limit=0 \
+     --write-bw-limit=0
+
+
 Remove Cluster
 ++++++++++++++
 
 .. prompt:: bash #
 
-   ceph smb cluster rm <cluster_id> [--password-filter=<password_filter>]
+   ceph smb cluster rm <cluster_id> [--recursive] [--wildcard] [--password-filter=<password_filter>]
 
 Remove a logical SMB cluster from the Ceph cluster.
 
@@ -179,6 +229,14 @@ Options:
 
 cluster_id
     A ``cluster_id`` value identifying a cluster resource.
+recursive
+    If the ``--recursive`` flag is included in the command the cluster
+    and the shares contained by that cluster will be automatically
+    removed.
+wildcard
+    If the ``--wildcard`` flag is included in the command the ``cluster_id``
+    value will be treated as a glob_ style wildcard. All clusters with an ID
+    matching the glob pattern will be removed.
 password_filter
     Optional. One of ``none``, ``base64``, or ``hidden``. If the filter is
     ``none`` the password fields in the output are emitted as plain text. If
@@ -262,16 +320,14 @@ Create a read-only share at a custom path in the CephFS volume:
     ceph smb share create test1 plans cephfs \
         --path=/qbranch/top/secret/plans --readonly
 
-Update Share QoS
-++++++++++++++++
 
-.. prompt:: bash #
+.. _qos-parameters:
 
-   ceph smb share update cephfs qos <cluster_id> <share_id> [--read-iops-limit=<int>] [--write-iops-limit=<int>] [--read-bw-limit=<str>] [--write-bw-limit=<str>] [--read-burst-mult=<int>] [--write-burst-mult=<int>]
+QoS Parameters
+++++++++++++++
 
-Update Quality of Service (QoS) settings for a CephFS-backed share. This allows administrators to apply per-share rate limits on SMB input/output (I/O) operations, specifically limits on IOPS (Input/Output Operations per Second) and bandwidth (in bytes per second) for both read and write operations. Additionally, burst multipliers can be configured to allow temporary bursts above the configured limits.
-
-Options:
+The following Quality of Service (QoS) parameters are available for CephFS-backed shares.
+All parameters are optional and can be used independently.
 
 read_iops_limit
     Optional integer. Maximum number of read operations per second (0 = disabled).
@@ -326,6 +382,18 @@ larger bursts but may temporarily consume more resources.
    The burst multiplier only affects short-term spikes. The long-term average
    throughput remains limited by your configured IOPS and bandwidth limits.
 
+
+Update Share QoS
+++++++++++++++++
+
+.. prompt:: bash #
+
+   ceph smb share update cephfs qos <cluster_id> <share_id> [--read-iops-limit=<int>] [--write-iops-limit=<int>] [--read-bw-limit=<str>] [--write-bw-limit=<str>] [--read-burst-mult=<int>] [--write-burst-mult=<int>]
+
+Update Quality of Service (QoS) settings for a CephFS-backed share. This allows administrators to apply per-share rate limits on SMB input/output (I/O) operations, specifically limits on IOPS (Input/Output Operations per Second) and bandwidth (in bytes per second) for both read and write operations. Additionally, burst multipliers can be configured to allow temporary bursts above the configured limits.
+
+Options: See :ref:`qos-parameters` for detailed descriptions of all QoS parameters.
+
 Examples:
 
 Set QoS limits with burst multipliers for a share:
@@ -359,9 +427,23 @@ Remove Share
 
 .. prompt:: bash #
 
-   ceph smb share rm <cluster_id> <share_id>
+   ceph smb share rm <cluster_id> <share_id> [--wildcard]
 
 Remove an SMB Share from the cluster.
+
+Options:
+
+cluster_id
+    A ``cluster_id`` value identifying a cluster resource that contains
+    the share resource.
+share_id
+    A ``share_id`` value identifying the specific share within a cluster.
+wildcard
+    If the ``--wildcard`` flag is included in the command the ``share_id``
+    value will be treated as a glob_ style wildcard. All shares with an ID
+    matching the glob pattern will be removed.
+
+.. _glob: https://docs.python.org/3/library/fnmatch.html
 
 
 List Shares

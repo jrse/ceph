@@ -135,50 +135,6 @@ map<string, string> rgw_to_http_attrs;
 static map<string, string> generic_attrs_map;
 map<int, const char *> http_status_names;
 
-/*
- * make attrs look_like_this
- * converts dashes to underscores
- */
-string lowercase_underscore_http_attr(const string& orig)
-{
-  const char *s = orig.c_str();
-  char buf[orig.size() + 1];
-  buf[orig.size()] = '\0';
-
-  for (size_t i = 0; i < orig.size(); ++i, ++s) {
-    switch (*s) {
-      case '-':
-        buf[i] = '_';
-        break;
-      default:
-        buf[i] = tolower(*s);
-    }
-  }
-  return string(buf);
-}
-
-/*
- * make attrs LOOK_LIKE_THIS
- * converts dashes to underscores
- */
-string uppercase_underscore_http_attr(const string& orig)
-{
-  const char *s = orig.c_str();
-  char buf[orig.size() + 1];
-  buf[orig.size()] = '\0';
-
-  for (size_t i = 0; i < orig.size(); ++i, ++s) {
-    switch (*s) {
-      case '-':
-        buf[i] = '_';
-        break;
-      default:
-        buf[i] = toupper(*s);
-    }
-  }
-  return string(buf);
-}
-
 /* avoid duplicate hostnames in hostnames lists */
 static set<string> hostnames_set;
 static set<string> hostnames_s3website_set;
@@ -199,12 +155,13 @@ void rgw_rest_init(CephContext *cct, const rgw::sal::ZoneGroup& zone_group)
   list<string>::iterator iter;
   for (iter = extended_http_attrs.begin(); iter != extended_http_attrs.end(); ++iter) {
     string rgw_attr = RGW_ATTR_PREFIX;
-    rgw_attr.append(lowercase_underscore_http_attr(*iter));
+    // bidirectional mimics the '-' -> '_' behavior
+    lowercase_dash_transform(*iter, std::back_inserter(rgw_attr), true);
 
     rgw_to_http_attrs[rgw_attr] = camelcase_dash_http_attr(*iter);
 
     string http_header = "HTTP_";
-    http_header.append(uppercase_underscore_http_attr(*iter));
+    uppercase_dash_transform(*iter, std::back_inserter(http_header));
 
     generic_attrs_map[http_header] = rgw_attr;
   }
@@ -718,6 +675,10 @@ void abort_early(req_state *s, RGWOp* op, int err_no,
     }
 
     dump_errno(s);
+    if (err_no == -ERR_RATE_LIMITED && s->ratelimit_retry_after > 0) {
+      dump_header(s, "Retry-After",
+                  static_cast<long long>(s->ratelimit_retry_after));
+    }
     dump_bucket_from_state(s);
     if (err_no == -ERR_PERMANENT_REDIRECT || err_no == -ERR_WEBSITE_REDIRECT) {
       string dest_uri;
@@ -742,7 +703,12 @@ void abort_early(req_state *s, RGWOp* op, int err_no,
        *   x-amz-error-detail-Key: foo
        */
       end_header(s, op, NULL, error_content.size(), false, true);
-      RESTFUL_IO(s)->send_body(error_content.c_str(), error_content.size());
+      try {
+        RESTFUL_IO(s)->send_body(error_content.c_str(), error_content.size());
+      } catch (rgw::io::Exception& e) {
+        ldpp_dout(s, 0) << "ERROR: abort_early: send_body() returned err="
+                        << e.what() << dendl;
+      }
     } else {
       end_header(s, op);
     }
@@ -1233,7 +1199,9 @@ int RGWPostObj_ObjStore::read_with_boundary(ceph::bufferlist& bl,
 
     bufferptr bp(need_to_read);
 
+    ACCOUNTING_IO(s)->set_account(true);
     const auto read_len = recv_body(s, bp.c_str(), need_to_read);
+    ACCOUNTING_IO(s)->set_account(false);
     if (read_len < 0) {
       return read_len;
     }
@@ -1265,7 +1233,9 @@ int RGWPostObj_ObjStore::read_with_boundary(ceph::bufferlist& bl,
     if (left < skip + 2) {
       int need = skip + 2 - left;
       bufferptr boundary_bp(need);
+      ACCOUNTING_IO(s)->set_account(true);
       const int r = recv_body(s, boundary_bp.c_str(), need);
+      ACCOUNTING_IO(s)->set_account(false);
       if (r < 0) {
         return r;
       }

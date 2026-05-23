@@ -4,6 +4,7 @@
 #include <boost/algorithm/string/case_conv.hpp>
 #include <cstdint>
 #include <errno.h>
+#include <algorithm>
 #include <array>
 #include <string.h>
 #include <string_view>
@@ -435,7 +436,7 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
     dump_header(s, "Rgwx-Perm-Checked", "true");
 
     // check for GetObject(Version)Tagging permission to include tags in response
-    auto action = s->object->get_instance().empty() ? rgw::IAM::s3GetObjectTagging : rgw::IAM::s3GetObjectVersionTagging;
+    auto action = s->object_key.instance.empty() ? rgw::IAM::s3GetObjectTagging : rgw::IAM::s3GetObjectVersionTagging;
     // since we are already under s->system_request, if the request is not impersonating,
     // it can be assumed that it is not a user-mode replication.
     bool keep_tags = s->auth.identity->is_admin() || verify_object_permission(this, s, action);
@@ -1449,7 +1450,17 @@ struct ReplicationConfiguration {
       }
 
       if (pipe.dest.bucket) {
-        destination.bucket = ARN(*pipe.dest.bucket).to_string();
+        // The bucket name may already contain the full ARN from data
+        // written before commit b8f89327e1a ("rgw: handle destination
+        // bucket as an ARN in ReplicationConfiguration").  Detect this
+        // to avoid producing a doubled ARN like
+        // "arn:aws:s3:::arn:aws:s3:::bucket".
+        auto existing = ARN::parse(pipe.dest.bucket->name);
+        if (existing && existing->service == rgw::Service::s3) {
+          destination.bucket = existing->to_string();
+        } else {
+          destination.bucket = ARN(*pipe.dest.bucket).to_string();
+        }
       }
 
       filter.emplace();
@@ -1883,6 +1894,15 @@ int RGWListBucket_ObjStore_S3::get_common_params()
      shard_id = s->bucket_instance_shard_id;
     }
   }
+
+  // Parse x-amz-optional-object-attributes header.
+  const char* opt_attrs = s->info.env->get("HTTP_X_AMZ_OPTIONAL_OBJECT_ATTRIBUTES");
+  if (opt_attrs) {
+    auto tokens = ceph::split(opt_attrs, ", ");
+    fetch_restore_status =
+        std::find(tokens.begin(), tokens.end(), "RestoreStatus") != tokens.end();
+  }
+
   return 0;
 }
 
@@ -1916,6 +1936,30 @@ if(!continuation_token_exist) {
   marker = continuation_token;
 }
 return 0;
+}
+
+/**
+ * Emit <RestoreStatus> XML element for a listing entry.
+ * Only emits for RestoreAlreadyInProgress and CloudRestored states.
+ */
+static void dump_restore_status(req_state* s,
+                                const rgw_bucket_dir_entry_meta& meta)
+{
+  using RGWRestoreStatus = rgw::sal::RGWRestoreStatus;
+  auto status = static_cast<RGWRestoreStatus>(meta.restore_status);
+
+  if (status != RGWRestoreStatus::RestoreAlreadyInProgress &&
+      status != RGWRestoreStatus::CloudRestored) {
+    return;
+  }
+
+  bool in_progress = (status == RGWRestoreStatus::RestoreAlreadyInProgress);
+  s->formatter->open_object_section("RestoreStatus");
+  s->formatter->dump_bool("IsRestoreInProgress", in_progress);
+  if (!in_progress && meta.restore_expiry_date != ceph::real_time{}) {
+    dump_time(s, "RestoreExpiryDate", meta.restore_expiry_date);
+  }
+  s->formatter->close_section(); // RestoreStatus
 }
 
 void RGWListBucket_ObjStore_S3::send_common_versioned_response()
@@ -1999,6 +2043,9 @@ void RGWListBucket_ObjStore_S3::send_versioned_response()
         s->formatter->dump_int("Size", iter->meta.accounted_size);
         auto& storage_class = rgw_placement_rule::get_canonical_storage_class(iter->meta.storage_class);
         s->formatter->dump_string("StorageClass", storage_class.c_str());
+        if (fetch_restore_status) {
+          dump_restore_status(s, iter->meta);
+        }
       }
       dump_owner(s, iter->meta.owner, iter->meta.owner_display_name);
       if (iter->meta.appendable) {
@@ -2091,6 +2138,9 @@ void RGWListBucket_ObjStore_S3::send_response()
       s->formatter->dump_int("Size", iter->meta.accounted_size);
       auto& storage_class = rgw_placement_rule::get_canonical_storage_class(iter->meta.storage_class);
       s->formatter->dump_string("StorageClass", storage_class.c_str());
+      if (fetch_restore_status) {
+        dump_restore_status(s, iter->meta);
+      }
       dump_owner(s, iter->meta.owner, iter->meta.owner_display_name);
       if (s->system_request) {
 	s->formatter->dump_string("RgwxTag", iter->tag);
@@ -2166,6 +2216,9 @@ void RGWListBucket_ObjStore_S3v2::send_versioned_response()
         s->formatter->dump_int("Size", iter->meta.accounted_size);
         auto& storage_class = rgw_placement_rule::get_canonical_storage_class(iter->meta.storage_class);
         s->formatter->dump_string("StorageClass", storage_class.c_str());
+        if (fetch_restore_status) {
+          dump_restore_status(s, iter->meta);
+        }
       }
       if (fetchOwner == true) {
         dump_owner(s, iter->meta.owner, iter->meta.owner_display_name);
@@ -2235,6 +2288,9 @@ void RGWListBucket_ObjStore_S3v2::send_response()
       s->formatter->dump_int("Size", iter->meta.accounted_size);
       auto& storage_class = rgw_placement_rule::get_canonical_storage_class(iter->meta.storage_class);
       s->formatter->dump_string("StorageClass", storage_class.c_str());
+      if (fetch_restore_status) {
+        dump_restore_status(s, iter->meta);
+      }
       if (fetchOwner == true) {
         dump_owner(s, iter->meta.owner, iter->meta.owner_display_name);
       }
@@ -3186,7 +3242,8 @@ int RGWPostObj_ObjStore_S3::get_params(optional_yield y)
     return -EINVAL;
   }
 
-  s->object = s->bucket->get_object(rgw_obj_key(object_str));
+  s->object_key = object_str;
+  s->object = s->bucket->get_object(s->object_key);
 
   rebuild_key(s->object.get());
 
@@ -3883,7 +3940,7 @@ int RGWCopyObj_ObjStore_S3::get_params(optional_yield y)
       (s->bucket->get_tenant() == s->src_tenant_name) &&
       (s->bucket->get_name() == s->src_bucket_name) &&
       (s->object->get_name() == s->src_object->get_name()) &&
-      s->src_object->get_instance().empty() &&
+      s->src_object_key.instance.empty() &&
       (attrs_mod != rgw::sal::ATTRSMOD_REPLACE)) {
     need_to_check_storage_class = true;
   }
@@ -4998,7 +5055,6 @@ void RGWDeleteMultiObj_ObjStore_S3::send_partial_response(const rgw_obj_key& key
 
 void RGWDeleteMultiObj_ObjStore_S3::end_response()
 {
-  s->formatter->close_section();
   rgw_flush_formatter_and_reset(s, s->formatter);
 }
 
@@ -5631,20 +5687,26 @@ int RGWHandler_REST_S3::init_from_header(rgw::sal::Driver* driver,
       encoded_obj_str = req.substr(pos+1);
     }
 
+    s->object_key.name = encoded_obj_str;
+    s->object_key.instance = s->info.args.get("versionId");
+
     /* dang: s->bucket is never set here, since it's created with permissions.
      * These calls will always create an object with no bucket. */
     if (!encoded_obj_str.empty()) {
       if (s->bucket) {
-	s->object = s->bucket->get_object(rgw_obj_key(encoded_obj_str, s->info.args.get("versionId")));
+	s->object = s->bucket->get_object(s->object_key);
       } else {
-	s->object = driver->get_object(rgw_obj_key(encoded_obj_str, s->info.args.get("versionId")));
+	s->object = driver->get_object(s->object_key);
       }
     }
   } else {
+    s->object_key.name = req_name;
+    s->object_key.instance = s->info.args.get("versionId");
+
     if (s->bucket) {
-      s->object = s->bucket->get_object(rgw_obj_key(req_name, s->info.args.get("versionId")));
+      s->object = s->bucket->get_object(s->object_key);
     } else {
-      s->object = driver->get_object(rgw_obj_key(req_name, s->info.args.get("versionId")));
+      s->object = driver->get_object(s->object_key);
     }
   }
   return 0;
@@ -5729,6 +5791,7 @@ int RGWHandler_REST_S3::init(rgw::sal::Driver* driver, req_state *s,
       ldpp_dout(s, 0) << "failed to parse copy location" << dendl;
       return -EINVAL; // XXX why not -ERR_INVALID_BUCKET_NAME or -ERR_BAD_URL?
     }
+    s->src_object_key = key;
     s->src_object = driver->get_object(key);
   }
 
@@ -6100,6 +6163,7 @@ int RGWHandler_REST_S3Website::retarget(RGWOp* op, RGWOp** new_op, optional_yiel
    * dang: This could be problematic, since we're not actually replacing op, but
    * we are replacing s->object.  Something might have a pointer to it.
    */
+  s->object_key = new_obj;
   s->object = s->bucket->get_object(new_obj);
 
   return 0;
@@ -6132,6 +6196,7 @@ int RGWHandler_REST_S3Website::serve_errordoc(const DoutPrefixProvider *dpp, int
   /* This is okay.  It's an error, so nothing will run after this, and it can be
    * called by abort_early(), which can be called before s->object or s->bucket
    * are set up. Note, it won't have bucket. */
+  s->object_key = errordoc_key;
   s->object = driver->get_object(errordoc_key);
 
   ret = init_permissions(getop.get(), y);

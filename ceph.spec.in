@@ -144,6 +144,7 @@
 %global _find_debuginfo_dwz_opts %{nil}
 %endif
 %bcond_with sccache
+%bcond_with pypkg
 
 %{!?_udevrulesdir: %global _udevrulesdir /lib/udev/rules.d}
 %{!?tmpfiles_create: %global tmpfiles_create systemd-tmpfiles --create}
@@ -207,7 +208,7 @@ Epoch:		2
 %global _epoch_prefix %{?epoch:%{epoch}:}
 
 Summary:	User space components of the Ceph file system
-License:	LGPL-2.1 and LGPL-3.0 and CC-BY-SA-3.0 and GPL-2.0 and BSL-1.0 and BSD-3-Clause and MIT
+License:	LGPL-2.1-or-later AND LGPL-3.0-only AND CC-BY-SA-3.0 AND GPL-2.0-only AND BSL-1.0 AND BSD-2-Clause AND BSD-3-Clause AND MIT
 %if 0%{?suse_version}
 Group:		System/Filesystems
 %endif
@@ -311,7 +312,7 @@ BuildRequires:  yaml-cpp-devel >= 0.6
 BuildRequires:  librabbitmq-devel
 %endif
 %if 0%{with kafka_endpoint}
-BuildRequires:  librdkafka-devel
+BuildRequires:  librdkafka-devel >= 1.1.0
 %endif
 %if 0%{with lua_packages}
 Requires:  lua-devel
@@ -1540,6 +1541,9 @@ cmake .. \
 %if %{with sccache}
     -DWITH_SCCACHE=ON \
 %endif
+%if 0%{with pypkg}
+    -DWITH_PYPKG:BOOL=ON \
+%endif
 %if 0%{with cephadm_bundling}
 %if 0%{with cephadm_pip_deps}
     -DCEPHADM_BUNDLED_DEPENDENCIES=pip
@@ -2155,7 +2159,7 @@ fi
 
 %files -n ceph-exporter
 %{_bindir}/ceph-exporter
-%{_unitdir}/ceph-exporter.service
+%{_unitdir}/ceph-exporter@.service
 
 %files -n rbd-fuse
 %{_bindir}/rbd-fuse
@@ -2587,7 +2591,7 @@ fi
 
 %files -n python%{python3_pkgversion}-ceph-common
 %{python3_sitelib}/ceph
-%{python3_sitelib}/ceph-*.egg-info
+%{python3_sitelib}/ceph-*.%{?with_pypkg:dist}%{!?with_pypkg:egg}-info
 
 %if 0%{with cephfs_shell}
 %files -n cephfs-shell

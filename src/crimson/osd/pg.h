@@ -171,8 +171,6 @@ public:
     return get_acting_recovery_backfill();
   }
 
-  bool should_send_op(pg_shard_t peer, const hobject_t &hoid) override;
-
   spg_t primary_spg_t() const override {
     return spg_t(get_info().pgid.pgid, get_primary().shard);
   }
@@ -690,13 +688,16 @@ public:
   bool is_backfilling() const final {
     return peering_state.is_backfilling();
   }
+  bool is_deleted() const {
+    return peering_state.is_deleted();
+  }
   uint64_t get_last_user_version() const {
     return get_info().last_user_version;
   }
   bool get_need_up_thru() const {
     return peering_state.get_need_up_thru();
   }
-  bool should_send_op(pg_shard_t peer, const hobject_t &hoid) const;
+  bool should_send_op(pg_shard_t peer, const hobject_t &hoid) final;
   epoch_t get_same_interval_since() const {
     return get_info().history.same_interval_since;
   }
@@ -909,6 +910,14 @@ private:
   interruptible_future<seastar::stop_iteration> trim_snap(
     snapid_t to_trim,
     bool needs_pause);
+  /// Re-trigger snap trimming after scrub completion. Snap trimming is
+  /// deferred while the PG is scrubbing; call this from notify_scrub_end()
+  /// to resume. Spawns a SnapTrimInitiate operation to avoid nesting
+  /// interrupt conditions.
+  void kick_snap_trim();
+  /// Initiate the snap trim loop with all state checks. Called from
+  /// SnapTrimInitiate and on_active_actmap().
+  void initiate_snap_trim();
 
 private:
   PG_OSDMapGate osdmap_gate;
@@ -1151,6 +1160,7 @@ private:
   friend class WatchTimeoutRequest;
   friend class SnapTrimEvent;
   friend class SnapTrimObjSubEvent;
+  friend class SnapTrimInitiate;
   friend ECBackend;
 private:
 

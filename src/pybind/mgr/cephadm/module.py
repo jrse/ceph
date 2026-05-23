@@ -62,7 +62,7 @@ from mgr_module import (
     NotifyType,
     MonCommandFailed,
 )
-from mgr_util import build_url, NvmeofMetadataPoolHelper
+from mgr_util import build_url, is_valid_container_image_ref, NvmeofMetadataPoolHelper
 import orchestrator
 from orchestrator.module import to_format, Format
 
@@ -84,6 +84,7 @@ from .services.osd import OSDRemovalQueue, OSDService, OSD, NotFoundError
 from .services.monitoring import AlertmanagerService, PrometheusService
 from .services.node_proxy import NodeProxy
 from .services.smb import SMBService
+from .services.nvmeof import NvmeofService
 from .schedule import HostAssignment
 from .inventory import (
     Inventory,
@@ -412,6 +413,15 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             desc='Maximum number of OSD daemons upgraded in parallel.'
         ),
         Option(
+            'pg_autoscale_during_upgrade',
+            type='bool',
+            default=False,
+            desc='Opt-in to keep PG autoscaling enabled during OSD upgrades. '
+            'When False (default), cephadm disables pool autoscaling (sets noautoscale) '
+            'before OSD upgrades and restores it on completion/stop/failure. '
+            'Set to true to keep autoscaling on during upgrade.'
+        ),
+        Option(
             'service_discovery_port',
             type='int',
             default=8765,
@@ -578,6 +588,7 @@ class CephadmOrchestrator(orchestrator.Orchestrator, MgrModule):
             self.default_registry = ''
             self.autotune_memory_target_ratio = 0.0
             self.autotune_interval = 0
+            self.pg_autoscale_during_upgrade = False
             self.ssh_user: Optional[str] = None
             self._ssh_options: Optional[str] = None
             self.tkey = NamedTemporaryFile()
@@ -2666,6 +2677,36 @@ Then run the following:
 
         return f'Rotated key for {daemon_spec.name()}'
 
+    def _mon_public_network_changed(self, daemon_spec: CephadmDaemonDeploySpec) -> bool:
+        if daemon_spec.daemon_type != 'mon':
+            return False
+
+        rc_get, out_get, err_get = self.mon_command({
+            'prefix': 'config get',
+            'who': f'mon.{daemon_spec.daemon_id}',
+            'key': 'public_network'
+        })
+
+        if rc_get:
+            self.log.error(f'cmd: config get failed with: {err_get}, (errno:{rc_get})')
+            return False
+
+        rc_show, out_show, err_show = self.mon_command({
+            'prefix': 'config show',
+            'who': f'mon.{daemon_spec.daemon_id}',
+            'key': 'public_network'
+        })
+
+        if rc_show:
+            self.log.error(f'cmd: config show failed with: {err_show}, (errno:{rc_show})')
+            return False
+
+        if out_get == out_show:
+            return False
+
+        self.log.debug(f'mon.{daemon_spec.daemon_id} public network changed, redeploy instead of restart')
+        return True
+
     def _daemon_action(self,
                        daemon_spec: CephadmDaemonDeploySpec,
                        action: str,
@@ -2681,7 +2722,9 @@ Then run the following:
         if action == 'rotate-key':
             return self._rotate_daemon_key(daemon_spec)
 
-        if action == 'redeploy' or action == 'reconfig':
+        if action == 'redeploy' or action == 'reconfig' or (action == 'restart' and self._mon_public_network_changed(daemon_spec)):
+            if action == 'restart':
+                action = 'redeploy'  # to ensure proper behavior since we want redeploy
             if daemon_spec.daemon_type != 'osd':
                 daemon_spec = service_registry.get_service(daemon_type_to_service(
                     daemon_spec.daemon_type)).prepare_create(daemon_spec)
@@ -2722,6 +2765,9 @@ Then run the following:
                 raise OrchestratorError(
                     f'Cannot redeploy {daemon_type}.{daemon_id} with a new image: Supported '
                     f'types are: {", ".join(CEPH_IMAGE_TYPES)}')
+            if not is_valid_container_image_ref(image):
+                raise OrchestratorError(
+                    f'Invalid container image {image!r} (not a valid container image reference)')
 
             self.check_mon_command({
                 'prefix': 'config set',
@@ -3492,6 +3538,12 @@ Then run the following:
         return self.cert_mgr.key_ls(include_cephadm_generated_keys)
 
     @handle_orch_error
+    def get_nvmeof_tls_bundle(self, service_name: str, daemon_name: str) -> Dict[str, str]:
+        nvmeof_svc = cast(NvmeofService, service_registry.get_service('nvmeof'))
+        tls_bundle = nvmeof_svc.get_nvmeof_tls_bundle(service_name, daemon_name)
+        return tls_bundle._asdict() if tls_bundle else {}
+
+    @handle_orch_error
     def cert_store_get_cert(
         self,
         cert_name: str,
@@ -3875,6 +3927,30 @@ Then run the following:
                 )
         return cert_warning
 
+    def _is_adding_nvmeof_group_to_existing_service(self, nvmeof_spec: NvmeofServiceSpec) -> bool:
+        """
+        Check whether this spec is assigning a group to an existing NVMe-oF
+        service that does not have a group yet.
+
+        This allows an existing service to keep its current service_id while adding
+        a group for the first time. New services and services that already have a
+        group must still follow the normal service_id/group validation.
+        """
+        existing_spec = self.spec_store.active_specs.get(nvmeof_spec.service_name())
+        if existing_spec is None:
+            return False
+
+        if existing_spec.service_type != 'nvmeof':
+            return False
+
+        existing_nvmeof_spec = cast(NvmeofServiceSpec, existing_spec)
+
+        return (
+            existing_nvmeof_spec.service_id == nvmeof_spec.service_id
+            and not existing_nvmeof_spec.group
+            and bool(nvmeof_spec.group)
+        )
+
     def _apply_service_spec(self, spec: ServiceSpec) -> str:
         if spec.placement.is_empty():
             # fill in default placement
@@ -3932,11 +4008,13 @@ Then run the following:
             except OrchestratorError as e:
                 self.log.debug(f"{e}")
                 raise
-            nvmeof_spec = cast(NvmeofServiceSpec, spec)
             assert nvmeof_spec.service_id is not None  # for mypy
             if nvmeof_spec.group and not nvmeof_spec.service_id.endswith(nvmeof_spec.group):
-                raise OrchestratorError("The 'nvmeof' service id/name must end with '.<nvmeof-group-name>'. Found "
-                                        f"group name '{nvmeof_spec.group}' and service id '{nvmeof_spec.service_id}'")
+                if not self._is_adding_nvmeof_group_to_existing_service(nvmeof_spec):
+                    raise OrchestratorError(
+                        "The 'nvmeof' service id/name must end with '.<nvmeof-group-name>'. Found "
+                        f"group name '{nvmeof_spec.group}' and service id '{nvmeof_spec.service_id}'"
+                    )
             for sspec in [s.spec for s in self.spec_store.get_by_service_type('nvmeof')]:
                 nspec = cast(NvmeofServiceSpec, sspec)
                 if nvmeof_spec.group == nspec.group and nvmeof_spec.service_id != nspec.service_id:
@@ -4162,7 +4240,8 @@ Then run the following:
 
     @handle_orch_error
     def upgrade_start(self, image: str, version: str, daemon_types: Optional[List[str]] = None, host_placement: Optional[str] = None,
-                      services: Optional[List[str]] = None, limit: Optional[int] = None) -> str:
+                      services: Optional[List[str]] = None, limit: Optional[int] = None,
+                      bucket_type: Optional[str] = None, bucket_name: Optional[str] = None) -> str:
         if self.inventory.get_host_with_state("maintenance"):
             raise OrchestratorError("Upgrade aborted - you have host(s) in maintenance state")
         if self.offline_hosts:
@@ -4192,12 +4271,21 @@ Then run the following:
                 raise OrchestratorError(
                     f'Upgrade aborted - hosts parameter "{host_placement}" provided did not match any hosts')
 
+        if hosts and (bucket_type is not None or bucket_name is not None):
+            raise OrchestratorError(
+                '--hosts cannot be combined with --crush_bucket_type or --crush_bucket_name')
+
+        if services is not None and (bucket_type is not None or bucket_name is not None):
+            raise OrchestratorError(
+                '--services cannot be combined with --crush_bucket_type or --crush_bucket_name')
+
         if limit is not None:
             if limit < 1:
                 raise OrchestratorError(
                     f'Upgrade aborted - --limit arg must be a positive integer, not {limit}')
 
-        return self.upgrade.upgrade_start(image, version, daemon_types, hosts, services, limit)
+        return self.upgrade.upgrade_start(
+            image, version, daemon_types, hosts, services, limit, bucket_type, bucket_name)
 
     @handle_orch_error
     def upgrade_pause(self) -> str:
@@ -4323,11 +4411,11 @@ Then run the following:
         return "Stopped OSD(s) removal"
 
     @handle_orch_error
-    def remove_osds_status(self) -> List[OSD]:
+    def remove_osds_status(self) -> List[Dict[str, Any]]:
         """
         The CLI call to retrieve an osd removal report
         """
-        return self.to_remove_osds.all_osds()
+        return self.to_remove_osds.all_osds_status_json()
 
     @handle_orch_error
     def set_osd_spec(self, service_name: str, osd_ids: List[str]) -> str:

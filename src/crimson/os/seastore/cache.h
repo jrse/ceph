@@ -121,7 +121,7 @@ public:
 
     ++(get_by_src(stats.trans_created_by_src, src));
 
-    auto ret = std::make_unique<Transaction>(
+    auto ret = boost::intrusive_ptr(new Transaction(
       get_dummy_ordering_handle(),
       is_weak,
       src,
@@ -129,7 +129,7 @@ public:
         return on_transaction_destruct(t);
       },
       ++next_id,
-      cache_hint
+      cache_hint)
     );
     SUBDEBUGT(seastore_t, "created name={}, source={}, is_weak={}",
               *ret, name, src, is_weak);
@@ -681,7 +681,7 @@ public:
         needs_step_2 = !ret.is_paddr_known;
       }
     } else {
-      assert(!extent->is_pending_io());
+      assert(!extent->is_pending_io() || extent->is_exist_clean());
       assert(extent->is_pending_in_trans(t.get_trans_id()));
       ++access_stats.trans_pending;
       ++stats.access.trans_pending;

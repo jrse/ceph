@@ -539,6 +539,9 @@ class Orchestrator(object):
     def cert_store_key_ls(self, include_cephadm_generated_keys: bool = False) -> OrchResult[Dict[str, Any]]:
         raise NotImplementedError()
 
+    def get_nvmeof_tls_bundle(self, service_name: str, daemon_name: str) -> OrchResult[Dict[str, str]]:
+        raise NotImplementedError()
+
     def cert_store_get_cert(
         self,
         cert_name: str,
@@ -949,7 +952,8 @@ class Orchestrator(object):
         raise NotImplementedError()
 
     def upgrade_start(self, image: Optional[str], version: Optional[str], daemon_types: Optional[List[str]],
-                      hosts: Optional[str], services: Optional[List[str]], limit: Optional[int]) -> OrchResult[str]:
+                      hosts: Optional[str], services: Optional[List[str]], limit: Optional[int],
+                      bucket_type: Optional[str] = None, bucket_name: Optional[str] = None) -> OrchResult[str]:
         raise NotImplementedError()
 
     def upgrade_pause(self) -> OrchResult[str]:
